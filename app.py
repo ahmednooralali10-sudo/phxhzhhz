@@ -2,7 +2,6 @@ import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 import sys, time, json, ssl, socket, threading, asyncio, random, struct, uuid
 from datetime import datetime
-from threading import Thread
 
 import urllib3
 import httpx
@@ -27,18 +26,12 @@ PROTO_URL = "https://raw.githubusercontent.com/mdrajababof2378866-hue/Lojik/refs
 PROTO_LOCAL = "Proto.py"
 
 def _ensure_proto_file():
-    if os.path.exists(PROTO_LOCAL) and os.path.getsize(PROTO_LOCAL) > 500:
-        return
-    print("[*] Downloading Proto.py from GitHub...")
+    if os.path.exists(PROTO_LOCAL) and os.path.getsize(PROTO_LOCAL) > 500: return
     try:
         req = urllib.request.Request(PROTO_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             data = r.read()
-        if len(data) < 500:
-            raise RuntimeError("Downloaded file too small")
-        with open(PROTO_LOCAL, "wb") as f:
-            f.write(data)
-        print("[+] Proto.py downloaded successfully.")
+        with open(PROTO_LOCAL, "wb") as f: f.write(data)
     except Exception as e:
         print(f"[!] Failed to download Proto.py: {e}")
         sys.exit(1)
@@ -55,7 +48,7 @@ MajorLoginRes_pb = _proto.MajorLoginRes_pb
 GetLoginDataRes_pb = _proto.GetLoginDataRes_pb
 
 # ============================================================
-#  CONFIG (تم تسريع العمليات هنا)
+#  CONFIG
 # ============================================================
 ACCOUNTS_TXT_FILE = "Ariyan.txt"
 TOKEN_CACHE_FILE = "token_cache.json"
@@ -63,9 +56,9 @@ DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 KEEP_ALIVE_INTERVAL = 5.0
 MAX_LOGIN_ATTEMPTS = 3
-NUM_WORKERS = 20  # زدنا عدد العمال عشان تسجيل الدخول يكون أسرع
-REQ_PER_BOT_PER_SEC = 10  # زدنا سرعة الضرب
-V_INTERVAL = 0.05 # قللنا وقت الانتظار بين الضربات
+NUM_WORKERS = 20
+REQ_PER_BOT_PER_SEC = 10
+V_INTERVAL = 0.05
 
 AVATAR_POOL = [
     902055033, 902055004, 902055031, 902055001, 902055032,
@@ -97,7 +90,7 @@ _client_mm = httpx.Client(
 
 online_accounts = []
 online_lock = threading.Lock()
-active_tasks = {} # {uid: asyncio.Event}
+active_tasks = {}
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
@@ -105,11 +98,32 @@ _avatar_lock = threading.Lock()
 def get_next_avatar():
     global _avatar_cursor
     with _avatar_lock:
-        if _avatar_cursor >= len(AVATAR_POOL):
-            _avatar_cursor = 0
+        if _avatar_cursor >= len(AVATAR_POOL): _avatar_cursor = 0
         avatar = AVATAR_POOL[_avatar_cursor]
         _avatar_cursor += 1
     return avatar
+
+# ============================================================
+#  دالة جلب معلومات الهدف (الاسم، المستوى، الخ)
+# ============================================================
+async def get_target_info(uid):
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            # استخدام API عام لجلب معلومات اللاعب
+            url = f"https://api.reisxd.com/api/ffinfo?uid={uid}"
+            res = await client.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success":
+                    return {
+                        "name": data.get("name", "Unknown"),
+                        "level": data.get("level", "Unknown"),
+                        "region": data.get("region", "Unknown"),
+                        "uid": uid
+                    }
+    except Exception as e:
+        pass
+    return {"name": "غير معروف (السيرفر مشغول)", "level": "-", "region": "-", "uid": uid}
 
 # ============================================================
 #  ASYNC PACKET HELPERS
@@ -124,8 +138,7 @@ async def _dec_hex_async(H):
 async def _enc_varint_async(N):
     H = []
     while True:
-        B = N & 0x7F
-        N >>= 7
+        B = N & 0x7F; N >>= 7
         if N: B |= 0x80
         H.append(B)
         if not N: break
@@ -189,7 +202,7 @@ async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V):
     return await generate_packet_async(proto.hex(), '0515', K, V)
 
 # ============================================================
-#  DEVICE HELPERS
+#  DEVICE HELPERS & DNS
 # ============================================================
 def _generate_new_device_mm():
     device_list = [
@@ -222,64 +235,15 @@ def get_device_for_account_mm(account_identifier):
     except: pass
     return new_device
 
-# ============================================================
-#  DNS / SOCKET
-# ============================================================
-CLOUDFLARE_PRIMARY_DNS = "1.1.1.1"
-CLOUDFLARE_SECONDARY_DNS = "1.0.0.1"
-_DNS_CACHE = {}
-_DNS_CACHE_TTL = 300.0
-
 async def resolve_host_cloudflare(hostname):
     if not hostname: return hostname
     parts = hostname.split('.')
     if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts): return hostname
-    now = time.time()
-    if hostname in _DNS_CACHE:
-        ip, exp = _DNS_CACHE[hostname]
-        if now < exp: return ip
-
-    def _query_cloudflare(server_ip):
-        s = None
-        try:
-            tx_id = random.randint(1000, 65535)
-            header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
-            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b"\x00"
-            query_pkt = header + qname + struct.pack(">HH", 1, 1)
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.2)
-            s.sendto(query_pkt, (server_ip, 53))
-            resp, _ = s.recvfrom(1024)
-            if len(resp) >= 12:
-                ancount = struct.unpack(">H", resp[6:8])[0]
-                if ancount > 0:
-                    offset = 12 + len(qname) + 4
-                    for _ in range(ancount):
-                        if offset >= len(resp): break
-                        if (resp[offset] & 0xC0) == 0xC0: offset += 2
-                        else:
-                            while offset < len(resp) and resp[offset] != 0: offset += 1 + resp[offset]
-                            offset += 1
-                        if offset + 10 > len(resp): break
-                        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", resp[offset:offset+10]); offset += 10
-                        if rtype == 1 and rdlen == 4 and offset + 4 <= len(resp): return socket.inet_ntoa(resp[offset:offset+4])
-                        offset += rdlen
-        except: pass
-        finally:
-            if s:
-                try: s.close()
-                except: pass
-        return None
-
-    loop = asyncio.get_running_loop()
-    ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_PRIMARY_DNS)
-    if not ip: ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_SECONDARY_DNS)
-    if not ip:
-        try:
-            ip_info = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
-            if ip_info: ip = ip_info[0][4][0]
-        except: ip = hostname
-    if ip: _DNS_CACHE[hostname] = (ip, now + _DNS_CACHE_TTL)
-    return ip or hostname
+    try:
+        ip_info = await asyncio.get_running_loop().getaddrinfo(hostname, None, family=socket.AF_INET)
+        if ip_info: return ip_info[0][4][0]
+    except: pass
+    return hostname
 
 def optimize_tcp_socket(sock):
     try:
@@ -452,8 +416,7 @@ async def build_majorlogin_payload_mm(open_id, access_token, platform, client_ve
         ml.field_106 = "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b"
         ml.field_107 = "c8e41b7a93f02d56e1a94c7b8203f5d1"
         return await aes_encrypt_mm(ml.SerializeToString(), AES_KEY_MM, AES_IV_MM)
-    except Exception as e:
-        return None
+    except: return None
 
 async def send_majorlogin_mm(data, release_version, server_url):
     try:
@@ -510,13 +473,10 @@ async def build_tcp_startup_packet_mm(account_id, token, server_time, key, iv, t
     encode_token = token.encode()
     encrypted_packet = (await aes_encrypt_mm(encode_token, key, iv)).hex()
     encrypted_packet_length = f"{len(encrypted_packet) // 2:08x}"
-    if typ == 'OnLine':
-        return f"7219{uid_hex}{timestamp_hex}00000000{encrypted_packet_length}{encrypted_packet}"
-    else:
-        return f"8119{uid_hex}{timestamp_hex}{encrypted_packet_length}{encrypted_packet}"
+    if typ == 'OnLine': return f"7219{uid_hex}{timestamp_hex}00000000{encrypted_packet_length}{encrypted_packet}"
+    else: return f"8119{uid_hex}{timestamp_hex}{encrypted_packet_length}{encrypted_packet}"
 
-async def send_keep_alive_mm():
-    return bytes.fromhex("0219")
+async def send_keep_alive_mm(): return bytes.fromhex("0219")
 
 async def process_account_uid_pass_mm(uid, password):
     cached = cache_get(uid)
@@ -553,16 +513,13 @@ async def process_account_uid_pass_mm(uid, password):
         }
         cache_set(uid, account_data)
         return account_data
-    except Exception as e:
-        return None
+    except: return None
 
 # ============================================================
 #  ONLINE WORKER
 # ============================================================
 async def run_account_online_worker_mm(account_data):
     acc_id = str(account_data['account_id'])
-    nickname = account_data.get('nickname', 'Player')
-    level = account_data.get('level', 1)
     func_addrs = account_data.get('functional_addrs')
     key = account_data.get('aes_ak')
     iv = account_data.get('iv_i')
@@ -591,13 +548,6 @@ async def run_account_online_worker_mm(account_data):
                     data = await asyncio.wait_for(reader.read(1024), timeout=KEEP_ALIVE_INTERVAL)
                     if data == b'': raise ConnectionError("Server closed")
                 except asyncio.TimeoutError: pass
-        except asyncio.CancelledError:
-            try:
-                with online_lock:
-                    online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
-            except: pass
-            await safe_close_writer(writer)
-            raise
         except Exception:
             try:
                 with online_lock:
@@ -618,8 +568,7 @@ def load_accounts_from_ariyan_txt():
                 if content.strip().startswith("["):
                     data = json.loads(content)
                     for item in data:
-                        if "uid" in item and "password" in item:
-                            accounts.append({"uid": str(item["uid"]), "password": item["password"]})
+                        if "uid" in item and "password" in item: accounts.append({"uid": str(item["uid"]), "password": item["password"]})
                 else:
                     for line in content.splitlines():
                         l = line.strip()
@@ -632,7 +581,7 @@ def load_accounts_from_ariyan_txt():
                         if parts:
                             u, p = parts
                             if u.isdigit(): accounts.append({"uid": u, "password": p})
-        except Exception as e: print(f"Error reading {ACCOUNTS_TXT_FILE}: {e}")
+        except: pass
     return accounts
 
 async def worker_login_queue(worker_id, queue):
@@ -648,26 +597,22 @@ async def worker_login_queue(worker_id, queue):
             if account_data: break
             else: await asyncio.sleep(1.0)
 
-        if account_data:
-            asyncio.create_task(run_account_online_worker_mm(account_data))
+        if account_data: asyncio.create_task(run_account_online_worker_mm(account_data))
         queue.task_done()
-        await asyncio.sleep(0.1) # تسريع العملية
+        await asyncio.sleep(0.1)
 
 async def mm_main_loop():
     accounts = load_accounts_from_ariyan_txt()
     if not accounts: return
     total = len(accounts)
     queue = asyncio.Queue()
-    for acc in accounts:
-        await queue.put({'uid': acc['uid'], 'password': acc['password']})
-    for _ in range(NUM_WORKERS):
-        await queue.put(None)
+    for acc in accounts: await queue.put({'uid': acc['uid'], 'password': acc['password']})
+    for _ in range(NUM_WORKERS): await queue.put(None)
 
     workers = []
     for w in range(1, NUM_WORKERS + 1):
         t = asyncio.create_task(worker_login_queue(w, queue))
         workers.append(t)
-
     await asyncio.gather(*workers, return_exceptions=True)
 
 # ============================================================
@@ -677,11 +622,9 @@ async def spam_worker_for_uid(target_uid, stop_event):
     while not stop_event.is_set():
         with online_lock:
             snapshot = list(online_accounts)
-
         if not snapshot:
             await asyncio.sleep(1)
             continue
-
         for acc in snapshot:
             if stop_event.is_set(): break
             try:
@@ -690,9 +633,7 @@ async def spam_worker_for_uid(target_uid, stop_event):
                 if pkt and not acc['writer'].is_closing():
                     acc['writer'].write(pkt)
                     await acc['writer'].drain()
-            except Exception:
-                pass
-        
+            except: pass
         await asyncio.sleep(V_INTERVAL)
 
 # ============================================================
@@ -705,40 +646,44 @@ def start_loop():
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-# تشغيل الـ Loop في الخلفية عشان يشتغل الـ API والـ Async مع بعض
 threading.Thread(target=start_loop, daemon=True).start()
-
-# تشغيل تسجيل الدخول للحسابات في الخلفية بمجرد تشغيل السيرفر
 loop.call_soon_threadsafe(lambda: asyncio.create_task(mm_main_loop()))
 
 @app.route('/spam', methods=['GET'])
 def spam():
     uid = request.args.get('uid')
-    if not uid or not uid.isdigit():
-        return jsonify({"error": "Invalid UID"}), 400
+    if not uid or not uid.isdigit(): return jsonify({"error": "Invalid UID"}), 400
     
     if uid in active_tasks:
-        return jsonify({"status": "already_spamming", "uid": uid}), 200
+        return jsonify({"status": "already_spamming", "uid": uid, "message": "هذا الآيدي قاعد ينضرب عليه من قبل"}), 200
 
+    # جلب معلومات الهدف
+    target_info = asyncio.run_coroutine_threadsafe(get_target_info(uid), loop).result()
+    
     stop_event = asyncio.Event()
     active_tasks[uid] = stop_event
-    
-    # جدولة المهمة داخل الـ Loop
     loop.call_soon_threadsafe(lambda: asyncio.create_task(spam_worker_for_uid(uid, stop_event)))
     
-    return jsonify({"status": "started", "uid": uid, "online_bots": len(online_accounts)}), 200
+    online_count = len(online_accounts)
+    msg = "تم بدء الضرب بنجاح" if online_count > 0 else "تم بدء الضرب، لكن لا توجد حسابات جاهزة حالياً. انتظر دقيقة وسيبدأ تلقائياً."
+    
+    return jsonify({
+        "status": "started",
+        "target_info": target_info,
+        "online_bots": online_count,
+        "message": msg
+    }), 200
 
 @app.route('/stop', methods=['GET'])
 def stop():
     uid = request.args.get('uid')
-    if not uid:
-        return jsonify({"error": "Missing UID"}), 400
+    if not uid: return jsonify({"error": "Missing UID"}), 400
     
     if uid in active_tasks:
         stop_event = active_tasks[uid]
         loop.call_soon_threadsafe(stop_event.set)
         del active_tasks[uid]
-        return jsonify({"status": "stopped", "uid": uid}), 200
+        return jsonify({"status": "stopped", "uid": uid, "message": "تم إيقاف الضرب عن هذا الهدف"}), 200
     else:
         return jsonify({"error": "No active spam for this UID"}), 404
 
