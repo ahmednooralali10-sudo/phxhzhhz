@@ -11,7 +11,7 @@ from Crypto.Util.Padding import pad
 from google_play_scraper import app as play_scraper
 from protobuf_decoder.protobuf_decoder import Parser
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, request, jsonify
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -41,7 +41,6 @@ def _ensure_proto_file():
         print("[+] Proto.py downloaded successfully.")
     except Exception as e:
         print(f"[!] Failed to download Proto.py: {e}")
-        print(f"[!] Please download manually:\n    {PROTO_URL}")
         sys.exit(1)
 
 _ensure_proto_file()
@@ -56,25 +55,17 @@ MajorLoginRes_pb = _proto.MajorLoginRes_pb
 GetLoginDataRes_pb = _proto.GetLoginDataRes_pb
 
 # ============================================================
-#  CONFIG
+#  CONFIG (تم تسريع العمليات هنا)
 # ============================================================
-C = "\033[96m"
-G = "\033[92m"
-Y = "\033[93m"
-R = "\033[91m"
-RS = "\033[0m"
-BOLD = "\033[1m"
-M = "\033[95m"
-
 ACCOUNTS_TXT_FILE = "Ariyan.txt"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 KEEP_ALIVE_INTERVAL = 5.0
-MAX_LOGIN_ATTEMPTS = 2
-NUM_WORKERS = 3
-REQ_PER_BOT_PER_SEC = 8
-V_INTERVAL = 1.0
+MAX_LOGIN_ATTEMPTS = 3
+NUM_WORKERS = 20  # زدنا عدد العمال عشان تسجيل الدخول يكون أسرع
+REQ_PER_BOT_PER_SEC = 10  # زدنا سرعة الضرب
+V_INTERVAL = 0.05 # قللنا وقت الانتظار بين الضربات
 
 AVATAR_POOL = [
     902055033, 902055004, 902055031, 902055001, 902055032,
@@ -104,9 +95,9 @@ _client_mm = httpx.Client(
     limits=httpx.Limits(max_connections=1000, max_keepalive_connections=500)
 )
 
-TARGET_UID = None
 online_accounts = []
 online_lock = threading.Lock()
+active_tasks = {} # {uid: asyncio.Event}
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
@@ -462,7 +453,6 @@ async def build_majorlogin_payload_mm(open_id, access_token, platform, client_ve
         ml.field_107 = "c8e41b7a93f02d56e1a94c7b8203f5d1"
         return await aes_encrypt_mm(ml.SerializeToString(), AES_KEY_MM, AES_IV_MM)
     except Exception as e:
-        print(f"{R}â build_majorlogin error: {e}{RS}")
         return None
 
 async def send_majorlogin_mm(data, release_version, server_url):
@@ -564,7 +554,6 @@ async def process_account_uid_pass_mm(uid, password):
         cache_set(uid, account_data)
         return account_data
     except Exception as e:
-        print(f"{R}â process_account error: {e}{RS}")
         return None
 
 # ============================================================
@@ -577,9 +566,7 @@ async def run_account_online_worker_mm(account_data):
     func_addrs = account_data.get('functional_addrs')
     key = account_data.get('aes_ak')
     iv = account_data.get('iv_i')
-    if not func_addrs:
-        print(f"{R}â No gateway address for {acc_id}{RS}")
-        return
+    if not func_addrs: return
     ip, port = func_addrs.split(":")
     while True:
         writer = None; reader = None
@@ -594,7 +581,7 @@ async def run_account_online_worker_mm(account_data):
             writer.write(bytes.fromhex(tcp_startup)); await writer.drain()
             init_ka = await send_keep_alive_mm()
             if init_ka and not writer.is_closing(): writer.write(init_ka); await writer.drain()
-            print(f"{G}â ONLINE{RS} [{acc_id}] | {Y}{nickname}{RS} | Lvl {C}{level}{RS}")
+            
             with online_lock:
                 online_accounts.append({'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv})
             ka_bytes = await send_keep_alive_mm()
@@ -611,8 +598,7 @@ async def run_account_online_worker_mm(account_data):
             except: pass
             await safe_close_writer(writer)
             raise
-        except Exception as e:
-            print(f"{Y}â Connection lost {acc_id} ({e}). Reconnecting 5s...{RS}")
+        except Exception:
             try:
                 with online_lock:
                     online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
@@ -621,7 +607,7 @@ async def run_account_online_worker_mm(account_data):
             await asyncio.sleep(5)
 
 # ============================================================
-#  ACCOUNTS LOADER
+#  ACCOUNTS LOADER & LOGIN WORKERS
 # ============================================================
 def load_accounts_from_ariyan_txt():
     accounts = []
@@ -646,65 +632,34 @@ def load_accounts_from_ariyan_txt():
                         if parts:
                             u, p = parts
                             if u.isdigit(): accounts.append({"uid": u, "password": p})
-        except Exception as e: print(f"{R}â Error reading {ACCOUNTS_TXT_FILE}: {e}{RS}")
+        except Exception as e: print(f"Error reading {ACCOUNTS_TXT_FILE}: {e}")
     return accounts
 
-# ============================================================
-#  WORKER QUEUE
-# ============================================================
 async def worker_login_queue(worker_id, queue):
     while True:
-        try:
-            acc_info = await queue.get()
-        except asyncio.CancelledError:
-            break
-        if acc_info is None:
-            queue.task_done()
-            break
-        idx = acc_info['idx']
-        total = acc_info['total']
-        uid = acc_info['uid']
-        pwd = acc_info['password']
+        try: acc_info = await queue.get()
+        except asyncio.CancelledError: break
+        if acc_info is None: queue.task_done(); break
+        uid = acc_info['uid']; pwd = acc_info['password']
 
         account_data = None
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-            print(f"{C}[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...{RS}")
-            try:
-                account_data = await process_account_uid_pass_mm(uid, pwd)
-                if account_data: break
-                else:
-                    if attempt < MAX_LOGIN_ATTEMPTS:
-                        await asyncio.sleep(1.5)
-            except:
-                if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
+            account_data = await process_account_uid_pass_mm(uid, pwd)
+            if account_data: break
+            else: await asyncio.sleep(1.0)
 
-        if not account_data:
-            print(f"{R}[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}{RS}")
-            queue.task_done()
-            continue
-
-        asyncio.create_task(run_account_online_worker_mm(account_data))
-        await asyncio.sleep(0.8)
+        if account_data:
+            asyncio.create_task(run_account_online_worker_mm(account_data))
         queue.task_done()
+        await asyncio.sleep(0.1) # تسريع العملية
 
 async def mm_main_loop():
     accounts = load_accounts_from_ariyan_txt()
-    if not accounts:
-        print(f"{R}â No accounts found in '{ACCOUNTS_TXT_FILE}'!{RS}")
-        print(f"{Y}ð¡ Add accounts in {ACCOUNTS_TXT_FILE} as: UID:PASSWORD{RS}")
-        return
-
+    if not accounts: return
     total = len(accounts)
-    print(f"{C}ð {total} accounts | {NUM_WORKERS} parallel login workers | sequential per worker{RS}")
-    print(f"{M}ð Avatar pool: {len(AVATAR_POOL)} fixed entries (sequential rotation){RS}")
-    print(f"{M}ð Each bot sends {REQ_PER_BOT_PER_SEC} requests/sec (different avatar each){RS}")
-
     queue = asyncio.Queue()
-    for idx, acc in enumerate(accounts, start=1):
-        await queue.put({
-            'idx': idx, 'total': total,
-            'uid': acc['uid'], 'password': acc['password']
-        })
+    for acc in accounts:
+        await queue.put({'uid': acc['uid'], 'password': acc['password']})
     for _ in range(NUM_WORKERS):
         await queue.put(None)
 
@@ -715,178 +670,84 @@ async def mm_main_loop():
 
     await asyncio.gather(*workers, return_exceptions=True)
 
-    print(f"{G}â All {total} accounts processed. Keep-alive loops running.{RS}")
-    while True:
-        await asyncio.sleep(60)
-
 # ============================================================
-#  V-BADGE DISPATCHER
+#  V-BADGE API SPAMMER
 # ============================================================
-async def bot_blast_task(acc, cycle_no):
-    sent = 0
-    for i in range(REQ_PER_BOT_PER_SEC):
-        if TARGET_UID is None:
-            break
-        try:
-            avatar_id = get_next_avatar()
-            pkt = await yasser_SendInv_packet(acc['uid'], TARGET_UID, avatar_id, acc['key'], acc['iv'])
-            if pkt and not acc['writer'].is_closing():
-                acc['writer'].write(pkt)
-                await acc['writer'].drain()
-                sent += 1
-                print(f"{G}  â [{acc['uid']}] #{cycle_no}.{i+1} â {TARGET_UID} (avatar: {Y}{avatar_id}{G}){RS}")
-        except Exception as e:
-            print(f"{R}â [{acc['uid']}] vbadge error: {e}{RS}")
-    return sent
-
-async def vbadge_dispatcher_loop():
-    global TARGET_UID
-    print(f"{G}â¶ V-BADGE dispatcher waiting for online accounts...{RS}")
-
-    while True:
+async def spam_worker_for_uid(target_uid, stop_event):
+    while not stop_event.is_set():
         with online_lock:
-            if len(online_accounts) > 0:
-                break
-        await asyncio.sleep(0.5)
+            snapshot = list(online_accounts)
 
-    print(f"{G}â¶ V-BADGE dispatcher STARTED â target {TARGET_UID}{RS}")
-    print(f"{C}   Each bot sends {REQ_PER_BOT_PER_SEC} req/sec with different avatar{RS}")
+        if not snapshot:
+            await asyncio.sleep(1)
+            continue
 
-    cycle_no = 0
-    while True:
-        try:
-            with online_lock:
-                snapshot = list(online_accounts)
-
-            if not snapshot:
-                await asyncio.sleep(1.0)
-                continue
-
-            cycle_no += 1
-            total_sent = 0
-            total_bots = len(snapshot)
-
-            for bot_idx, acc in enumerate(snapshot, start=1):
-                if TARGET_UID is None:
-                    break
-                print(f"{C}ð¤ Bot {bot_idx}/{total_bots} [{acc['uid']}] blasting {REQ_PER_BOT_PER_SEC} req...{RS}")
-                sent = await bot_blast_task(acc, f"{cycle_no}-{bot_idx}")
-                total_sent += sent
-
-            print(f"{C}ââ cycle {cycle_no}: {total_sent} total req sent across {total_bots} bots ââ{RS}")
-            await asyncio.sleep(V_INTERVAL)
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"{R}â dispatcher error: {e}{RS}")
-            await asyncio.sleep(2)
+        for acc in snapshot:
+            if stop_event.is_set(): break
+            try:
+                avatar_id = get_next_avatar()
+                pkt = await yasser_SendInv_packet(acc['uid'], target_uid, avatar_id, acc['key'], acc['iv'])
+                if pkt and not acc['writer'].is_closing():
+                    acc['writer'].write(pkt)
+                    await acc['writer'].drain()
+            except Exception:
+                pass
+        
+        await asyncio.sleep(V_INTERVAL)
 
 # ============================================================
-#  FLASK WEB SERVER
+#  FLASK API ROUTES
 # ============================================================
 app = Flask(__name__)
-is_spamming = False
-spam_thread = None
+loop = asyncio.new_event_loop()
 
-INDEX_HTML = """
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <title>Ariyan V-Badge Spam</title>
-    <style>
-        body { background: #0f0f0f; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; flex-direction: column; }
-        .container { background: #1a1a1a; padding: 40px; border-radius: 15px; box-shadow: 0 0 20px rgba(255, 0, 100, 0.2); text-align: center; }
-        h1 { color: #ff3366; margin-bottom: 30px; }
-        input { padding: 15px; width: 300px; border-radius: 8px; border: 1px solid #333; background: #222; color: #fff; font-size: 16px; margin-bottom: 20px; outline: none; text-align: center; }
-        input:focus { border-color: #ff3366; }
-        button { padding: 15px 30px; background: #ff3366; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; transition: 0.3s; width: 100%; }
-        button:hover { background: #e62e5c; transform: scale(1.02); }
-        #status { margin-top: 20px; font-weight: bold; color: #00ffcc; }
-        .footer { margin-top: 30px; color: #666; font-size: 14px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>ARIYAN V-BADGE SPAM</h1>
-        <input type="text" id="uid" placeholder="أدخل آيدي الهدف (Target UID)" required>
-        <button onclick="startSpam()">ابدأ الضرب (START SPAM)</button>
-        <div id="status"></div>
-        <div class="footer">Powered by XOREYT</div>
-    </div>
+def start_loop():
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
-    <script>
-        function startSpam() {
-            const uid = document.getElementById('uid').value.trim();
-            if (!uid) { alert('الرجاء إدخال الآيدي'); return; }
-            
-            const statusDiv = document.getElementById('status');
-            statusDiv.innerText = 'جاري التشغيل...';
-            
-            fetch('/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ uid: uid })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    statusDiv.style.color = '#00ffcc';
-                    statusDiv.innerText = data.message;
-                } else {
-                    statusDiv.style.color = '#ff3333';
-                    statusDiv.innerText = data.error;
-                }
-            })
-            .catch(err => {
-                statusDiv.style.color = '#ff3333';
-                statusDiv.innerText = 'خطأ في الاتصال بالسيرفر.';
-            });
-        }
-    </script>
-</body>
-</html>
-"""
+# تشغيل الـ Loop في الخلفية عشان يشتغل الـ API والـ Async مع بعض
+threading.Thread(target=start_loop, daemon=True).start()
 
-@app.route('/')
-def index():
-    return render_template_string(INDEX_HTML)
+# تشغيل تسجيل الدخول للحسابات في الخلفية بمجرد تشغيل السيرفر
+loop.call_soon_threadsafe(lambda: asyncio.create_task(mm_main_loop()))
 
-@app.route('/start', methods=['POST'])
-def start_spam():
-    global TARGET_UID, is_spamming, spam_thread
-    
-    data = request.json
-    uid = data.get('uid')
-    
+@app.route('/spam', methods=['GET'])
+def spam():
+    uid = request.args.get('uid')
     if not uid or not uid.isdigit():
-        return jsonify({"success": False, "error": "آيدي غير صالح"})
-        
-    TARGET_UID = uid
+        return jsonify({"error": "Invalid UID"}), 400
     
-    if not is_spamming:
-        is_spamming = True
-        def run_async_main():
-            global is_spamming
-            async def run_all():
-                asyncio.create_task(mm_main_loop())
-                await asyncio.sleep(2)
-                await vbadge_dispatcher_loop()
-            
-            try:
-                asyncio.run(run_all())
-            except Exception as e:
-                print(f"Async Loop Error: {e}")
-            finally:
-                is_spamming = False
-                
-        spam_thread = threading.Thread(target=run_async_main, daemon=True)
-        spam_thread.start()
-        
-        return jsonify({"success": True, "message": f"بدأ الضرب على الآيدي: {TARGET_UID}"})
+    if uid in active_tasks:
+        return jsonify({"status": "already_spamming", "uid": uid}), 200
+
+    stop_event = asyncio.Event()
+    active_tasks[uid] = stop_event
     
-    return jsonify({"success": True, "message": f"تم تحديث الهدف إلى: {TARGET_UID}"})
+    # جدولة المهمة داخل الـ Loop
+    loop.call_soon_threadsafe(lambda: asyncio.create_task(spam_worker_for_uid(uid, stop_event)))
+    
+    return jsonify({"status": "started", "uid": uid, "online_bots": len(online_accounts)}), 200
+
+@app.route('/stop', methods=['GET'])
+def stop():
+    uid = request.args.get('uid')
+    if not uid:
+        return jsonify({"error": "Missing UID"}), 400
+    
+    if uid in active_tasks:
+        stop_event = active_tasks[uid]
+        loop.call_soon_threadsafe(stop_event.set)
+        del active_tasks[uid]
+        return jsonify({"status": "stopped", "uid": uid}), 200
+    else:
+        return jsonify({"error": "No active spam for this UID"}), 404
+
+@app.route('/status', methods=['GET'])
+def status():
+    return jsonify({
+        "online_bots": len(online_accounts),
+        "active_targets": list(active_tasks.keys())
+    }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
