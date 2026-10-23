@@ -1,4 +1,5 @@
 flask
+urllib3
 httpx
 pycryptodome
 google-play-scraper
