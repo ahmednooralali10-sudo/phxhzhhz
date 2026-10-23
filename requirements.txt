@@ -1,4 +1,8 @@
 flask
+httpx
+pycryptodome
+google-play-scraper
+protobuf-decoder
 aiohttp
 protobuf
-pycryptodome
+gunicorn
