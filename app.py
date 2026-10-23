@@ -33,7 +33,7 @@ def _ensure_proto_file():
             data = r.read()
         with open(PROTO_LOCAL, "wb") as f: f.write(data)
     except Exception as e:
-        print(f"[!] Failed to download Proto.py: {e}")
+        print(f"[!] Failed to download Proto.py: {e}", flush=True)
         sys.exit(1)
 
 _ensure_proto_file()
@@ -88,9 +88,13 @@ _client_mm = httpx.Client(
     limits=httpx.Limits(max_connections=1000, max_keepalive_connections=500)
 )
 
-online_accounts = []
+# ============================================================
+#  STATE
+# ============================================================
+online_accounts = []          # list of {uid, writer, key, iv, client_version, region}
 online_lock = threading.Lock()
-active_tasks = {}
+active_tasks = {}             # {uid: asyncio.Event}
+active_tasks_lock = threading.Lock()
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
@@ -104,26 +108,27 @@ def get_next_avatar():
     return avatar
 
 # ============================================================
-#  دالة جلب معلومات الهدف (الاسم، المستوى، الخ)
+#  TARGET INFO (non-blocking helper)
 # ============================================================
 async def get_target_info(uid):
+    """محاولة جلب معلومات الهدف. لا تفشل أبداً - ترجع قيم افتراضية."""
+    default = {"name": "غير معروف", "level": "-", "region": "-", "uid": uid}
     try:
-        async with httpx.AsyncClient(verify=False) as client:
-            # استخدام API عام لجلب معلومات اللاعب
+        async with httpx.AsyncClient(verify=False, timeout=3.0) as client:
             url = f"https://api.reisxd.com/api/ffinfo?uid={uid}"
-            res = await client.get(url, timeout=10)
+            res = await client.get(url)
             if res.status_code == 200:
                 data = res.json()
                 if data.get("status") == "success":
                     return {
-                        "name": data.get("name", "Unknown"),
-                        "level": data.get("level", "Unknown"),
-                        "region": data.get("region", "Unknown"),
+                        "name": data.get("name", "غير معروف"),
+                        "level": data.get("level", "-"),
+                        "region": data.get("region", "-"),
                         "uid": uid
                     }
-    except Exception as e:
+    except Exception:
         pass
-    return {"name": "غير معروف (السيرفر مشغول)", "level": "-", "region": "-", "uid": uid}
+    return default
 
 # ============================================================
 #  ASYNC PACKET HELPERS
@@ -174,19 +179,21 @@ async def generate_packet_async(hex_payload, ptype, K, V):
     return bytes.fromhex(header + length_hex + enc)
 
 # ============================================================
-#  V-BADGE PACKET
+#  V-BADGE PACKET (نسخة ديناميكية - تقرأ client_version والمنطقة من الحساب)
 # ============================================================
-async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V):
+async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V,
+                                 client_version="1.132.6", bot_region="BD"):
     fields = {
         1: 33,
         2: {
-            1: int(target_uid), 2: "ME", 3: 1, 4: 1,
+            1: int(target_uid), 2: bot_region, 3: 1, 4: 1,
             6: "yyt", 7: 330, 8: 1000, 9: 100,
-            10: "DZ", 12: 1, 13: int(target_uid),
+            10: bot_region, 12: 1, 13: int(target_uid),
             16: 1,
-            17: {2: 159, 4: "y[WW", 6: 11, 8: "1.118.1", 9: 3, 10: 1},
+            17: {2: 159, 4: "y[WW", 6: 11, 8: client_version, 9: 3, 10: 1},
             18: 306, 19: 18, 24: 902000306,
-            26: {}, 27: {1: 11, 2: int(bot_uid), 3: 999},
+            26: {},
+            27: {1: 11, 2: int(bot_uid), 3: 999},
             28: {},
             31: {1: 1, 2: 32768},
             32: 32768,
@@ -211,12 +218,16 @@ def _generate_new_device_mm():
         ("OnePlus", "CPH2451", "Adreno (TM) 740", "Android OS 13 / API-33"),
     ]
     brand, model, gpu, os_ver = random.choice(device_list)
-    return {"unique_device_id": f"Google|{uuid.uuid4()}", "brand": brand, "model": model,
-            "gpu_renderer": gpu, "system_software": os_ver,
-            "screen_width": random.choice([1080, 1600]), "screen_height": random.choice([2400, 720]),
-            "screen_dpi": str(random.randint(300, 420)), "memory": random.randint(2800, 6500),
-            "processor_details": f"ARM64 FP ASIMD AES VMH | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
-            "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}"}
+    return {
+        "unique_device_id": f"Google|{uuid.uuid4()}",
+        "brand": brand, "model": model, "gpu_renderer": gpu, "system_software": os_ver,
+        "screen_width": random.choice([1080, 1600]),
+        "screen_height": random.choice([2400, 720]),
+        "screen_dpi": str(random.randint(300, 420)),
+        "memory": random.randint(2800, 6500),
+        "processor_details": f"ARM64 FP ASIMD AES VMH | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
+        "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}"
+    }
 
 def get_device_for_account_mm(account_identifier):
     devices = {}
@@ -348,7 +359,7 @@ async def get_playstore_version_mm():
     try:
         result = await loop.run_in_executor(None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id'))
         return result.get("version")
-    except: return "1.132.6"
+    except: return None
 
 async def version_config_mm():
     try:
@@ -356,7 +367,8 @@ async def version_config_mm():
         api_url = (f"https://version.ggwhitehawk.com/live/ver.php?version={app_version}"
                    "&lang=hi&device=android&channel=android&appstore=googleplay&region=BD"
                    "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
-        response = await asyncio.get_running_loop().run_in_executor(None, lambda: _client_mm.get(api_url, timeout=8.0))
+        response = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _client_mm.get(api_url, timeout=8.0))
         if response.status_code == 200:
             data = response.json()
             s_url = data.get("server_url"); r_ver = data.get("remote_version"); l_rel = data.get("latest_release_version")
@@ -366,16 +378,27 @@ async def version_config_mm():
 
 async def get_access_token_mm(uid, password):
     url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
-    hdrs = {"Host": "100067.connect.garena.com", "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 13;en;IN;)",
-            "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate, br", "Connection": "close"}
-    payload = {"client_id": 100067, "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-               "client_type": 2, "password": str(password).strip(), "response_type": "token", "uid": int(str(uid).strip())}
+    hdrs = {
+        "Host": "100067.connect.garena.com",
+        "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 13;en;IN;)",
+        "Content-Type": "application/json",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "close"
+    }
+    payload = {
+        "client_id": 100067,
+        "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+        "client_type": 2, "password": str(password).strip(),
+        "response_type": "token", "uid": int(str(uid).strip())
+    }
     for attempt in range(2):
         try:
-            response = await asyncio.get_running_loop().run_in_executor(None, lambda: _client_mm.post(url, headers=hdrs, json=payload))
+            response = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: _client_mm.post(url, headers=hdrs, json=payload))
             if response.status_code == 200:
                 res_data = response.json(); inner = res_data.get("data", res_data)
-                open_id = inner.get("open_id"); access_token = inner.get("access_token"); platform = inner.get("platform", 4)
+                open_id = inner.get("open_id"); access_token = inner.get("access_token")
+                platform = inner.get("platform", 4)
                 if open_id and access_token: return open_id, access_token, platform
             elif response.status_code == 429:
                 await asyncio.sleep(1.0); continue
@@ -422,7 +445,8 @@ async def send_majorlogin_mm(data, release_version, server_url):
     try:
         url = f"{server_url}MajorLogin"
         req_headers = headers_mm.copy(); req_headers["ReleaseVersion"] = release_version
-        response = await asyncio.get_running_loop().run_in_executor(None, lambda: _client_mm.post(url, headers=req_headers, data=data))
+        response = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _client_mm.post(url, headers=req_headers, data=data))
         if response.status_code != 200: return None
         response_content = response.content
         if len(response_content) < 40: return None
@@ -447,7 +471,8 @@ async def send_getlogin_mm(data, base_url, token, release_version):
         url = f"{base_url.rstrip('/')}/GetLoginData"
         req_headers = headers_mm.copy(); req_headers["ReleaseVersion"] = release_version
         req_headers['Authorization'] = f"Bearer {token}"; req_headers['Host'] = "clientbp.ppmainecoonghj.com"
-        response = await asyncio.get_running_loop().run_in_executor(None, lambda: _client_mm.post(url, headers=req_headers, data=data))
+        response = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _client_mm.post(url, headers=req_headers, data=data))
         if response.status_code != 200: return None
         response_content = response.content
         res_proto = GetLoginDataRes_pb(); parsed_successfully = False
@@ -473,8 +498,10 @@ async def build_tcp_startup_packet_mm(account_id, token, server_time, key, iv, t
     encode_token = token.encode()
     encrypted_packet = (await aes_encrypt_mm(encode_token, key, iv)).hex()
     encrypted_packet_length = f"{len(encrypted_packet) // 2:08x}"
-    if typ == 'OnLine': return f"7219{uid_hex}{timestamp_hex}00000000{encrypted_packet_length}{encrypted_packet}"
-    else: return f"8119{uid_hex}{timestamp_hex}{encrypted_packet_length}{encrypted_packet}"
+    if typ == 'OnLine':
+        return f"7219{uid_hex}{timestamp_hex}00000000{encrypted_packet_length}{encrypted_packet}"
+    else:
+        return f"8119{uid_hex}{timestamp_hex}{encrypted_packet_length}{encrypted_packet}"
 
 async def send_keep_alive_mm(): return bytes.fromhex("0219")
 
@@ -512,18 +539,24 @@ async def process_account_uid_pass_mm(uid, password):
             'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password
         }
         cache_set(uid, account_data)
+        print(f"[+] Logged in {uid} as {nickname} | region={region} ver={client_version}", flush=True)
         return account_data
-    except: return None
+    except Exception as e:
+        print(f"[!] Login failed {uid}: {e}", flush=True)
+        return None
 
 # ============================================================
-#  ONLINE WORKER
+#  ONLINE WORKER (يحفظ client_version وregion ويمنع التكرار)
 # ============================================================
 async def run_account_online_worker_mm(account_data):
     acc_id = str(account_data['account_id'])
     func_addrs = account_data.get('functional_addrs')
     key = account_data.get('aes_ak')
     iv = account_data.get('iv_i')
+    client_ver = account_data.get('client_version', '1.132.6')
+    region = account_data.get('region', 'BD')
     if not func_addrs: return
+    
     ip, port = func_addrs.split(":")
     while True:
         writer = None; reader = None
@@ -539,22 +572,28 @@ async def run_account_online_worker_mm(account_data):
             init_ka = await send_keep_alive_mm()
             if init_ka and not writer.is_closing(): writer.write(init_ka); await writer.drain()
             
+            # منع تكرار نفس الحساب في القائمة
             with online_lock:
-                online_accounts.append({'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv})
+                online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
+                online_accounts.append({
+                    'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv,
+                    'client_version': client_ver, 'region': region,
+                })
+            print(f"[✓] Online: {acc_id} ({account_data.get('nickname','?')})", flush=True)
+            
             ka_bytes = await send_keep_alive_mm()
             while True:
+                if writer.is_closing(): raise ConnectionError("closed")
                 writer.write(ka_bytes); await writer.drain()
                 try:
                     data = await asyncio.wait_for(reader.read(1024), timeout=KEEP_ALIVE_INTERVAL)
                     if data == b'': raise ConnectionError("Server closed")
                 except asyncio.TimeoutError: pass
         except Exception:
-            try:
-                with online_lock:
-                    online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
-            except: pass
+            with online_lock:
+                online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
             await safe_close_writer(writer)
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
 # ============================================================
 #  ACCOUNTS LOADER & LOGIN WORKERS
@@ -568,7 +607,8 @@ def load_accounts_from_ariyan_txt():
                 if content.strip().startswith("["):
                     data = json.loads(content)
                     for item in data:
-                        if "uid" in item and "password" in item: accounts.append({"uid": str(item["uid"]), "password": item["password"]})
+                        if "uid" in item and "password" in item:
+                            accounts.append({"uid": str(item["uid"]), "password": item["password"]})
                 else:
                     for line in content.splitlines():
                         l = line.strip()
@@ -581,7 +621,8 @@ def load_accounts_from_ariyan_txt():
                         if parts:
                             u, p = parts
                             if u.isdigit(): accounts.append({"uid": u, "password": p})
-        except: pass
+        except Exception as e:
+            print(f"[!] Failed to load accounts: {e}", flush=True)
     return accounts
 
 async def worker_login_queue(worker_id, queue):
@@ -590,25 +631,25 @@ async def worker_login_queue(worker_id, queue):
         except asyncio.CancelledError: break
         if acc_info is None: queue.task_done(); break
         uid = acc_info['uid']; pwd = acc_info['password']
-
         account_data = None
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
             account_data = await process_account_uid_pass_mm(uid, pwd)
             if account_data: break
-            else: await asyncio.sleep(1.0)
-
-        if account_data: asyncio.create_task(run_account_online_worker_mm(account_data))
+            await asyncio.sleep(1.0)
+        if account_data:
+            asyncio.create_task(run_account_online_worker_mm(account_data))
         queue.task_done()
         await asyncio.sleep(0.1)
 
 async def mm_main_loop():
     accounts = load_accounts_from_ariyan_txt()
-    if not accounts: return
-    total = len(accounts)
+    if not accounts:
+        print("[!] No accounts found in Ariyan.txt", flush=True)
+        return
+    print(f"[*] Loaded {len(accounts)} accounts. Starting login workers...", flush=True)
     queue = asyncio.Queue()
     for acc in accounts: await queue.put({'uid': acc['uid'], 'password': acc['password']})
     for _ in range(NUM_WORKERS): await queue.put(None)
-
     workers = []
     for w in range(1, NUM_WORKERS + 1):
         t = asyncio.create_task(worker_login_queue(w, queue))
@@ -616,28 +657,35 @@ async def mm_main_loop():
     await asyncio.gather(*workers, return_exceptions=True)
 
 # ============================================================
-#  V-BADGE API SPAMMER
+#  V-BADGE SPAMMER (يبدأ فوراً حتى لو ما في بوتات جاهزة)
 # ============================================================
 async def spam_worker_for_uid(target_uid, stop_event):
+    print(f"[*] Spam worker STARTED for {target_uid}", flush=True)
     while not stop_event.is_set():
         with online_lock:
             snapshot = list(online_accounts)
         if not snapshot:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             continue
         for acc in snapshot:
             if stop_event.is_set(): break
             try:
                 avatar_id = get_next_avatar()
-                pkt = await yasser_SendInv_packet(acc['uid'], target_uid, avatar_id, acc['key'], acc['iv'])
+                pkt = await yasser_SendInv_packet(
+                    acc['uid'], target_uid, avatar_id, acc['key'], acc['iv'],
+                    client_version=acc.get('client_version', '1.132.6'),
+                    bot_region=acc.get('region', 'BD'),
+                )
                 if pkt and not acc['writer'].is_closing():
                     acc['writer'].write(pkt)
                     await acc['writer'].drain()
-            except: pass
+            except Exception:
+                pass
         await asyncio.sleep(V_INTERVAL)
+    print(f"[*] Spam worker STOPPED for {target_uid}", flush=True)
 
 # ============================================================
-#  FLASK API ROUTES
+#  FLASK API
 # ============================================================
 app = Flask(__name__)
 loop = asyncio.new_event_loop()
@@ -649,51 +697,67 @@ def start_loop():
 threading.Thread(target=start_loop, daemon=True).start()
 loop.call_soon_threadsafe(lambda: asyncio.create_task(mm_main_loop()))
 
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({"status": "ok", "online_bots": len(online_accounts), "active": len(active_tasks)}), 200
+
 @app.route('/spam', methods=['GET'])
 def spam():
     uid = request.args.get('uid')
-    if not uid or not uid.isdigit(): return jsonify({"error": "Invalid UID"}), 400
-    
-    if uid in active_tasks:
-        return jsonify({"status": "already_spamming", "uid": uid, "message": "هذا الآيدي قاعد ينضرب عليه من قبل"}), 200
+    if not uid or not uid.isdigit():
+        return jsonify({"error": "Invalid UID"}), 400
 
-    # جلب معلومات الهدف
-    target_info = asyncio.run_coroutine_threadsafe(get_target_info(uid), loop).result()
-    
-    stop_event = asyncio.Event()
-    active_tasks[uid] = stop_event
-    loop.call_soon_threadsafe(lambda: asyncio.create_task(spam_worker_for_uid(uid, stop_event)))
-    
+    # التحقق من عدم التكرار
+    with active_tasks_lock:
+        if uid in active_tasks:
+            return jsonify({"status": "already_spamming", "uid": uid,
+                            "message": "هذا الآيدي قاعد ينضرب من قبل"}), 200
+        # ✅ ابدأ الضرب فوراً قبل جلب الاسم
+        stop_event = asyncio.Event()
+        active_tasks[uid] = stop_event
+        loop.call_soon_threadsafe(
+            lambda u=uid, s=stop_event: asyncio.create_task(spam_worker_for_uid(u, s)))
+
+    # محاولة جلب معلومات الهدف بـ timeout قصير (لا تفشل الطلب لو تأخرت)
+    target_info = {"name": "جاري الجلب...", "level": "-", "region": "-", "uid": uid}
+    try:
+        fut = asyncio.run_coroutine_threadsafe(get_target_info(uid), loop)
+        target_info = fut.result(timeout=2.0)
+    except Exception:
+        target_info = {"name": "غير معروف", "level": "-", "region": "-", "uid": uid}
+
     online_count = len(online_accounts)
-    msg = "تم بدء الضرب بنجاح" if online_count > 0 else "تم بدء الضرب، لكن لا توجد حسابات جاهزة حالياً. انتظر دقيقة وسيبدأ تلقائياً."
-    
     return jsonify({
         "status": "started",
         "target_info": target_info,
         "online_bots": online_count,
-        "message": msg
+        "message": "✅ بدأ الضرب فوراً" if online_count > 0
+                   else "⏳ الضرب شغّال، سينتظر تجهيز البوتات تلقائياً"
     }), 200
 
 @app.route('/stop', methods=['GET'])
 def stop():
     uid = request.args.get('uid')
-    if not uid: return jsonify({"error": "Missing UID"}), 400
-    
-    if uid in active_tasks:
-        stop_event = active_tasks[uid]
-        loop.call_soon_threadsafe(stop_event.set)
-        del active_tasks[uid]
-        return jsonify({"status": "stopped", "uid": uid, "message": "تم إيقاف الضرب عن هذا الهدف"}), 200
-    else:
-        return jsonify({"error": "No active spam for this UID"}), 404
+    if not uid:
+        return jsonify({"error": "Missing UID"}), 400
+    with active_tasks_lock:
+        ev = active_tasks.pop(uid, None)
+    if ev:
+        loop.call_soon_threadsafe(ev.set)
+        return jsonify({"status": "stopped", "uid": uid, "message": "تم إيقاف الضرب"}), 200
+    return jsonify({"error": "No active spam for this UID"}), 404
 
 @app.route('/status', methods=['GET'])
 def status():
     return jsonify({
         "online_bots": len(online_accounts),
-        "active_targets": list(active_tasks.keys())
+        "active_targets": list(active_tasks.keys()),
+        "online_details": [
+            {"uid": a['uid'], "version": a.get('client_version'), "region": a.get('region')}
+            for a in list(online_accounts)
+        ]
     }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
