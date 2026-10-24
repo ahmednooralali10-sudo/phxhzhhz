@@ -8,12 +8,9 @@ from typing import Optional, Dict, List
 
 import urllib3
 import httpx
-import urllib.request
-import importlib.util
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google_play_scraper import app as play_scraper
-from protobuf_decoder.protobuf_decoder import Parser
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -23,39 +20,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-# ============================================================
-#  PROTOBUF DEFINITIONS
-# ============================================================
-PROTO_URL = "https://raw.githubusercontent.com/mdrajababof2378866-hue/Lojik/refs/heads/main/Proto.py"
-PROTO_LOCAL = "Proto.py"
-
-def _ensure_proto_file():
-    if os.path.exists(PROTO_LOCAL) and os.path.getsize(PROTO_LOCAL) > 500:
-        return
-    print("[*] Downloading Proto.py from GitHub...")
-    try:
-        req = urllib.request.Request(PROTO_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read()
-        if len(data) < 500:
-            raise RuntimeError("Downloaded file too small — probably 404")
-        with open(PROTO_LOCAL, "wb") as f:
-            f.write(data)
-        print("[+] Proto.py downloaded successfully.")
-    except Exception as e:
-        print(f"[!] Failed to download Proto.py: {e}")
-        sys.exit(1)
-
-_ensure_proto_file()
-
-_spec = importlib.util.spec_from_file_location("Proto", PROTO_LOCAL)
-_proto = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_proto)
-
-MajorLogin_pb = _proto.MajorLogin_pb
-MajorLoginRes_pb = _proto.MajorLoginRes_pb
-GetLoginDataRes_pb = _proto.GetLoginDataRes_pb
 
 # ============================================================
 #  CONFIG
@@ -119,14 +83,13 @@ _avatar_lock = threading.Lock()
 def get_next_avatar():
     global _avatar_cursor
     with _avatar_lock:
-        if _avatar_cursor >= len(AVATAR_POOL):
-            _avatar_cursor = 0
+        if _avatar_cursor >= len(AVATAR_POOL): _avatar_cursor = 0
         a = AVATAR_POOL[_avatar_cursor]
         _avatar_cursor += 1
     return a
 
 # ============================================================
-#  ASYNC PACKET HELPERS
+#  ASYNC PACKET HELPERS (Custom Protobuf Builder)
 # ============================================================
 async def EnC_PacKeT_async(HeX, K, V):
     return AES.new(K, AES.MODE_CBC, V).encrypt(pad(bytes.fromhex(HeX), 16)).hex()
@@ -359,28 +322,6 @@ def cache_invalidate(uid):
 async def aes_encrypt_mm(payload, key, iv):
     return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
-def get_proto_field(d, key, default=None):
-    if not d or not isinstance(d, dict): return default
-    if key in d:
-        v = d[key].get('data'); return v if v is not None else default
-    if str(key) in d:
-        v = d[str(key)].get('data'); return v if v is not None else default
-    return default
-
-async def parse_results_mm(parsed_results):
-    out = {}
-    for r in parsed_results:
-        fd = {"wire_type": r.wire_type}
-        if r.wire_type == "varint": fd["data"] = r.data
-        elif r.wire_type == "string": fd["data"] = r.data
-        elif r.wire_type == "bytes": fd["data"] = r.data
-        elif r.wire_type == "length_delimited":
-            if hasattr(r.data, "results"): fd["data"] = await parse_results_mm(r.data.results)
-            elif isinstance(r.data, list): fd["data"] = await parse_results_mm(r.data)
-            else: fd["data"] = str(r.data)
-        out[str(r.field)] = fd
-    return out
-
 async def get_playstore_version_mm():
     loop = asyncio.get_event_loop()
     try:
@@ -428,40 +369,78 @@ async def get_access_token_mm(uid, password):
 
 async def build_majorlogin_payload_mm(open_id, access_token, platform, client_version, device_info):
     try:
-        ml = MajorLogin_pb()
-        ml.open_id = open_id; ml.access_token = access_token; ml.client_version = client_version
-        ml.event_time = str(datetime.now())[:-7]; ml.game_name = "free fire"; ml.platform_id = 1
-        ml.system_software = "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)"
-        ml.system_hardware = "Handheld"; ml.telecom_operator = "Ncell"; ml.network_type = "WIFI"
-        ml.screen_width = 1600; ml.screen_height = 720; ml.screen_dpi = "320"
-        ml.processor_details = "ARMv7 VFPv3 NEON | 2001 | 8"; ml.memory = 3790
-        ml.gpu_renderer = "PowerVR Rogue GE8320"; ml.gpu_version = "OpenGL ES 3.2 build 1.11@5425693"
-        ml.unique_device_id = "Google|00000000-0000-0000-0000-000000000000"
-        ml.client_ip = "111.119.38.133"; ml.language = "en"; ml.open_id_type = "4"; ml.device_type = "Handheld"
-        ml.device_model = "Xiaomi M2006C3LII"; ml.country_code = "BD"; ml.platform_sdk_id = 1
-        ml.network_operator_a = "Ncell"; ml.network_type_a = "WIFI"
-        ml.client_using_version = "1ac4b80ecf0478a44203bf8fac6120f5"
-        ml.external_storage_total = 53041; ml.external_storage_available = 7291
-        ml.internal_storage_total = 2176; ml.game_disk_storage_available = 7395
-        ml.game_disk_storage_total = 53041; ml.external_sdcard_avail_storage = 7395; ml.external_sdcard_total_storage = 53041
-        ml.field_70 = 4; ml.login_by = 2
-        ml.library_path = "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm"
-        ml.reg_avatar = 1
-        ml.library_token = "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk"
-        ml.channel_type = 6; ml.cpu_type = 1; ml.cpu_architecture = "32"; ml.client_version_code = "2019121227"
-        ml.field_85 = 3; ml.graphics_api = "OpenGLES2"; ml.supported_astc_bitset = 3071
-        ml.login_open_id_type = 4; ml.loading_time = 9329; ml.release_channel = "3rd_party"
-        ml.extra_info = "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug="
-        ml.android_engine_init_flag = 111207
-        ml.field_96 = json.dumps({"cur_rate": None, "support_etc2": False}, separators=(',', ':'))
-        ml.if_push = 1; ml.origin_platform_type = "4"; ml.primary_platform_type = "4"
-        ml.field_102 = bytes.fromhex("42 54 4c 10 53 0e 5b 04 30"); ml.field_104 = 47591; ml.field_105 = 1
-        ml.field_106 = "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b"
-        ml.field_107 = "c8e41b7a93f02d56e1a94c7b8203f5d1"
-        return await aes_encrypt_mm(ml.SerializeToString(), AES_KEY_MM, AES_IV_MM)
+        # بناء MajorLogin protobuf يدوياً بدون مكتبة google
+        fields = {
+            1: open_id, 2: access_token, 3: client_version,
+            4: str(datetime.now())[:-7], 5: "free fire", 6: 1,
+            7: "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)",
+            8: "Handheld", 9: "Ncell", 10: "WIFI",
+            11: 1600, 12: 720, 13: "320",
+            14: "ARMv7 VFPv3 NEON | 2001 | 8", 15: 3790,
+            16: "PowerVR Rogue GE8320", 17: "OpenGL ES 3.2 build 1.11@5425693",
+            18: "Google|00000000-0000-0000-0000-000000000000",
+            19: "111.119.38.133", 20: "en", 21: "4", 22: "Handheld",
+            23: "Xiaomi M2006C3LII", 24: "BD", 25: 1,
+            26: "Ncell", 27: "WIFI",
+            28: "1ac4b80ecf0478a44203bf8fac6120f5",
+            29: 53041, 30: 7291, 31: 2176, 32: 7395, 33: 53041, 34: 7395, 35: 53041,
+            70: 4, 71: 2,
+            72: "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm",
+            73: 1, 74: "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk",
+            75: 6, 76: 1, 77: "32", 78: "2019121227",
+            85: 3, 86: "OpenGLES2", 87: 3071, 88: 4, 89: 9329, 90: "3rd_party",
+            91: "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug=",
+            92: 111207,
+            96: json.dumps({"cur_rate": None, "support_etc2": False}, separators=(',', ':')),
+            97: 1, 98: "4", 99: "4",
+            102: bytes.fromhex("42 54 4c 10 53 0e 5b 04 30"),
+            104: 47591, 105: 1,
+            106: "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b",
+            107: "c8e41b7a93f02d56e1a94c7b8203f5d1",
+        }
+        proto_bytes = await create_proto_async(fields)
+        return await aes_encrypt_mm(proto_bytes, AES_KEY_MM, AES_IV_MM)
     except Exception as e:
-        print(f"{R}❌ build_majorlogin error: {e}{RS}")
+        print(f"❌ build_majorlogin error: {e}")
         return None
+
+# --- دوال قراءة الردود بدون protobuf ---
+def read_varint(data, offset):
+    result = 0; shift = 0
+    while True:
+        if offset >= len(data): return None, offset
+        b = data[offset]; offset += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80): break
+        shift += 7
+    return result, offset
+
+def parse_protobuf_response(data):
+    res = {}
+    offset = 0
+    while offset < len(data):
+        tag, offset = read_varint(data, offset)
+        if tag is None: break
+        field_num = tag >> 3
+        wire_type = tag & 7
+        if wire_type == 0:
+            val, offset = read_varint(data, offset)
+            if val is not None: res[field_num] = val
+        elif wire_type == 2:
+            length, offset = read_varint(data, offset)
+            if length is None: break
+            val = data[offset:offset+length]
+            offset += length
+            res[field_num] = val
+        elif wire_type == 5:
+            val = data[offset:offset+4]; offset += 4
+            res[field_num] = val
+        elif wire_type == 1:
+            val = data[offset:offset+8]; offset += 8
+            res[field_num] = val
+        else:
+            break
+    return res
 
 async def send_majorlogin_mm(data, release_version, server_url):
     try:
@@ -471,21 +450,22 @@ async def send_majorlogin_mm(data, release_version, server_url):
             None, lambda: _client_mm.post(url, headers=h, data=data))
         if r.status_code != 200: return None
         c = r.content
-        if len(c) < 40: return None
         payload = c[64:] if len(c) > 64 else c
-        proto = MajorLoginRes_pb()
-        try:
-            proto.ParseFromString(payload)
-            if proto.token: return proto
-        except: pass
-        for off in range(min(128, len(payload))):
-            try:
-                cand = MajorLoginRes_pb(); cand.ParseFromString(payload[off:])
-                if cand.token: return cand
-            except: pass
-        try:
-            proto = MajorLoginRes_pb(); proto.ParseFromString(c); return proto
-        except: return None
+        
+        parsed = parse_protobuf_response(payload)
+        if not parsed.get(1): return None  # token
+        
+        class LoginRes:
+            pass
+        res = LoginRes()
+        res.token = parsed.get(1).decode(errors='ignore') if isinstance(parsed.get(1), bytes) else ""
+        res.server_url = parsed.get(2).decode(errors='ignore') if isinstance(parsed.get(2), bytes) else ""
+        res.account_id = parsed.get(3) or 0
+        res.kts = parsed.get(4) or 0
+        res.ak = parsed.get(5) if isinstance(parsed.get(5), bytes) else b''
+        res.aiv = parsed.get(6) if isinstance(parsed.get(6), bytes) else b''
+        res.noti_region = parsed.get(7).decode(errors='ignore') if isinstance(parsed.get(7), bytes) else "BD"
+        return res
     except: return None
 
 async def send_getlogin_mm(data, base_url, token, release_version):
@@ -496,23 +476,15 @@ async def send_getlogin_mm(data, base_url, token, release_version):
         r = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _client_mm.post(url, headers=h, data=data))
         if r.status_code != 200: return None
-        c = r.content; proto = GetLoginDataRes_pb(); ok = False
-        try:
-            proto.ParseFromString(c)
-            if proto.functional_addrs or proto.informational_addrs: ok = True
-        except: pass
-        if not ok:
-            for off in range(min(128, len(c))):
-                try:
-                    cand = GetLoginDataRes_pb(); cand.ParseFromString(c[off:])
-                    if cand.functional_addrs or cand.informational_addrs:
-                        proto = cand; break
-                except: pass
-        dr = {}
-        try:
-            dr = await parse_results_mm(Parser().parse(c.hex()))
-        except: pass
-        return proto, dr
+        c = r.content
+        parsed = parse_protobuf_response(c)
+        
+        class GetLoginRes:
+            pass
+        res = GetLoginRes()
+        res.functional_addrs = parsed.get(1).decode(errors='ignore') if isinstance(parsed.get(1), bytes) else ""
+        res.nickname = parsed.get(2).decode(errors='ignore') if isinstance(parsed.get(2), bytes) else "Player"
+        return res, parsed
     except: return None
 
 async def build_tcp_startup_packet_mm(account_id, token, server_time, key, iv, typ='OnLine'):
@@ -547,16 +519,16 @@ async def process_account_uid_pass_mm(uid, password):
         acc_id = str(mlr.account_id)
         data = {
             'account_id': mlr.account_id,
-            'nickname': rp.nickname or get_proto_field(dr, 4, f"Player_{acc_id}"),
-            'region': mlr.noti_region or get_proto_field(dr, 3, "BD"),
-            'level': int(get_proto_field(dr, 6, 1)),
-            'exp': int(get_proto_field(dr, 7, 0)),
-            'likes': int(get_proto_field(dr, 8, 0)),
+            'nickname': rp.nickname,
+            'region': mlr.noti_region,
+            'level': int(dr.get(6, 1)),
+            'exp': int(dr.get(7, 0)),
+            'likes': int(dr.get(8, 0)),
             'open_id': oid, 'access_token': at, 'platform': str(plat),
             'token': mlr.token, 'server_time': mlr.kts,
             'aes_ak': mlr.ak, 'iv_i': mlr.aiv,
-            'functional_addrs': rp.functional_addrs or get_proto_field(dr, 14),
-            'informational_addrs': rp.informational_addrs or get_proto_field(dr, 32),
+            'functional_addrs': rp.functional_addrs,
+            'informational_addrs': "",
             'release_version': rel, 'client_version': cver,
             'server_url': mlr.server_url, 'login_payload_data': payload,
             'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password
@@ -564,7 +536,7 @@ async def process_account_uid_pass_mm(uid, password):
         cache_set(uid, data)
         return data
     except Exception as e:
-        print(f"{R}❌ process_account error: {e}{RS}")
+        print(f"❌ process_account error: {e}")
         return None
 
 # ============================================================
@@ -635,11 +607,10 @@ def load_accounts_from_ariyan_txt():
                         u, p = parts
                         if u.isdigit(): accounts.append({"uid": u, "password": p})
         except Exception as e:
-            print(f"{R}❌ Error reading {ACCOUNTS_TXT_FILE}: {e}{RS}")
+            print(f"❌ Error reading {ACCOUNTS_TXT_FILE}: {e}")
     return accounts
 
 def load_accounts():
-    # 1) env var
     raw = os.environ.get("ACCOUNTS_DATA", "").strip()
     if raw:
         accs = []
@@ -655,7 +626,6 @@ def load_accounts():
                 u, p = parts
                 if u.isdigit(): accs.append({"uid": u, "password": p})
         if accs: return accs
-    # 2) local file
     return load_accounts_from_ariyan_txt()
 
 # ============================================================
@@ -673,7 +643,7 @@ async def worker_login_queue(worker_id, queue):
         uid = acc_info['uid']; pwd = acc_info['password']
         ad = None
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-            print(f"{C}[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...{RS}")
+            print(f"[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...")
             try:
                 ad = await process_account_uid_pass_mm(uid, pwd)
                 if ad: break
@@ -681,7 +651,7 @@ async def worker_login_queue(worker_id, queue):
             except:
                 if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
         if not ad:
-            print(f"{R}[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}{RS}")
+            print(f"[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}")
             queue.task_done(); continue
         asyncio.create_task(run_account_online_worker_mm(ad))
         await asyncio.sleep(0.8)
@@ -690,10 +660,10 @@ async def worker_login_queue(worker_id, queue):
 async def mm_main_loop():
     accounts = load_accounts()
     if not accounts:
-        print(f"{R}❌ No accounts found!{RS}")
+        print("❌ No accounts found!")
         return
     total = len(accounts)
-    print(f"{C}🔁 {total} accounts | {NUM_WORKERS} workers{RS}")
+    print(f"🔁 {total} accounts | {NUM_WORKERS} workers")
     queue = asyncio.Queue()
     for idx, acc in enumerate(accounts, start=1):
         await queue.put({'idx': idx, 'total': total,
@@ -704,7 +674,7 @@ async def mm_main_loop():
     for w in range(1, NUM_WORKERS + 1):
         workers.append(asyncio.create_task(worker_login_queue(w, queue)))
     await asyncio.gather(*workers, return_exceptions=True)
-    print(f"{G}✅ All {total} accounts processed. Keep-alive loops running.{RS}")
+    print(f"✅ All {total} accounts processed. Keep-alive loops running.")
     while True:
         await asyncio.sleep(60)
 
@@ -721,19 +691,19 @@ async def bot_blast_task(acc, cycle_no):
             if pkt and not acc['writer'].is_closing():
                 acc['writer'].write(pkt); await acc['writer'].drain()
                 sent += 1
-                print(f"{G}  ✓ [{acc['uid']}] #{cycle_no}.{i+1} → {TARGET_UID} (avatar: {Y}{av}{G}){RS}")
+                print(f"  ✓ [{acc['uid']}] #{cycle_no}.{i+1} → {TARGET_UID} (avatar: {av})")
         except Exception as e:
-            print(f"{R}❌ [{acc['uid']}] vbadge error: {e}{RS}")
+            print(f"❌ [{acc['uid']}] vbadge error: {e}")
     return sent
 
 async def vbadge_dispatcher_loop():
     global TARGET_UID
-    print(f"{G}▶ V-BADGE dispatcher waiting for online accounts...{RS}")
+    print(f"▶ V-BADGE dispatcher waiting for online accounts...")
     while True:
         with online_lock:
             if online_accounts: break
         await asyncio.sleep(0.5)
-    print(f"{G}▶ V-BADGE dispatcher STARTED → target {TARGET_UID}{RS}")
+    print(f"▶ V-BADGE dispatcher STARTED → target {TARGET_UID}")
     cycle_no = 0
     while True:
         try:
@@ -744,14 +714,14 @@ async def vbadge_dispatcher_loop():
             cycle_no += 1; total_sent = 0; total_bots = len(snap)
             for bi, acc in enumerate(snap, start=1):
                 if TARGET_UID is None: break
-                print(f"{C}🤖 Bot {bi}/{total_bots} [{acc['uid']}] blasting {REQ_PER_BOT_PER_SEC} req...{RS}")
+                print(f"🤖 Bot {bi}/{total_bots} [{acc['uid']}] blasting {REQ_PER_BOT_PER_SEC} req...")
                 total_sent += await bot_blast_task(acc, f"{cycle_no}-{bi}")
-            print(f"{C}── cycle {cycle_no}: {total_sent} req across {total_bots} bots ──{RS}")
+            print(f"── cycle {cycle_no}: {total_sent} req across {total_bots} bots ──")
             await asyncio.sleep(V_INTERVAL)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"{R}❌ dispatcher error: {e}{RS}")
+            print(f"❌ dispatcher error: {e}")
             await asyncio.sleep(2)
 
 # ============================================================
@@ -821,15 +791,7 @@ app = FastAPI(title="Ariyan V-Badge API", version="1.0")
 
 @app.get("/")
 def root():
-    return {
-        "name": "Ariyan V-Badge API",
-        "endpoints": {
-            "start": "/start?uid=TARGET_UID",
-            "stop": "/stop?uid=TARGET_UID",
-            "status": "/status",
-            "health": "/health",
-        },
-    }
+    return {"name": "Ariyan V-Badge API", "endpoints": {"/start?uid=": "start", "/stop": "stop", "/status": "status"}}
 
 @app.get("/health")
 def health():
@@ -838,19 +800,12 @@ def health():
 @app.get("/start")
 def api_start(uid: str = Query(..., description="Target UID")):
     if not uid.isdigit():
-        return JSONResponse(status_code=400,
-                            content={"ok": False, "error": "uid must be numeric"})
+        return JSONResponse(status_code=400, content={"ok": False, "error": "uid must be numeric"})
     accs = load_accounts()
     if not accs:
-        return JSONResponse(status_code=400, content={
-            "ok": False,
-            "error": "No accounts configured. Set ACCOUNTS_DATA env or add Ariyan.txt.",
-        })
+        return JSONResponse(status_code=400, content={"ok": False, "error": "No accounts configured."})
     started, msg = start_service(uid)
-    return {
-        "ok": True, "started": started, "message": msg,
-        "target_uid": TARGET_UID, "accounts_loaded": len(accs),
-    }
+    return {"ok": True, "started": started, "message": msg, "target_uid": TARGET_UID, "accounts_loaded": len(accs)}
 
 @app.get("/stop")
 def api_stop(uid: Optional[str] = Query(None)):
@@ -861,22 +816,8 @@ def api_stop(uid: Optional[str] = Query(None)):
 def api_status():
     with online_lock:
         bots = [{"uid": a["uid"]} for a in online_accounts]
-    return {
-        "running": _running,
-        "target_uid": TARGET_UID,
-        "online_bots_count": len(bots),
-        "online_bots": bots,
-        "config": {
-            "req_per_bot_per_sec": REQ_PER_BOT_PER_SEC,
-            "interval": V_INTERVAL,
-            "avatar_pool_size": len(AVATAR_POOL),
-            "num_workers": NUM_WORKERS,
-        },
-    }
+    return {"running": _running, "target_uid": TARGET_UID, "online_bots_count": len(bots), "online_bots": bots}
 
-# ============================================================
-#  MAIN
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("api:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
