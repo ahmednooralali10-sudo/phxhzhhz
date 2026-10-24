@@ -33,9 +33,10 @@ DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 KEEP_ALIVE_INTERVAL = 5.0
 MAX_LOGIN_ATTEMPTS = 2
-NUM_WORKERS = 3
+NUM_WORKERS = 10              # رُفع من 3 إلى 10 لتسريع دخول الحسابات
 REQ_PER_BOT_PER_SEC = 8
 V_INTERVAL = 1.0
+FIRST_ONLINE_TIMEOUT = 90     # أقصى انتظار لأول بوت يصبح ONLINE
 
 AVATAR_POOL = [
     902055033, 902055004, 902055031, 902055001, 902055032,
@@ -76,6 +77,10 @@ _login_task: Optional[asyncio.Task] = None
 _dispatch_task: Optional[asyncio.Task] = None
 _running = False
 _state_lock = threading.Lock()
+_service_thread: Optional[Thread] = None
+
+# event يُطلق عند أول بوت يصبح ONLINE فعليًا
+_first_online_event = threading.Event()
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
@@ -89,7 +94,7 @@ def get_next_avatar():
     return a
 
 # ============================================================
-#  ASYNC PACKET HELPERS (Custom Protobuf Builder)
+#  ASYNC PACKET HELPERS
 # ============================================================
 async def EnC_PacKeT_async(HeX, K, V):
     return AES.new(K, AES.MODE_CBC, V).encrypt(pad(bytes.fromhex(HeX), 16)).hex()
@@ -369,7 +374,6 @@ async def get_access_token_mm(uid, password):
 
 async def build_majorlogin_payload_mm(open_id, access_token, platform, client_version, device_info):
     try:
-        # بناء MajorLogin protobuf يدوياً بدون مكتبة google
         fields = {
             1: open_id, 2: access_token, 3: client_version,
             4: str(datetime.now())[:-7], 5: "free fire", 6: 1,
@@ -404,7 +408,6 @@ async def build_majorlogin_payload_mm(open_id, access_token, platform, client_ve
         print(f"❌ build_majorlogin error: {e}")
         return None
 
-# --- دوال قراءة الردود بدون protobuf ---
 def read_varint(data, offset):
     result = 0; shift = 0
     while True:
@@ -451,12 +454,9 @@ async def send_majorlogin_mm(data, release_version, server_url):
         if r.status_code != 200: return None
         c = r.content
         payload = c[64:] if len(c) > 64 else c
-        
         parsed = parse_protobuf_response(payload)
-        if not parsed.get(1): return None  # token
-        
-        class LoginRes:
-            pass
+        if not parsed.get(1): return None
+        class LoginRes: pass
         res = LoginRes()
         res.token = parsed.get(1).decode(errors='ignore') if isinstance(parsed.get(1), bytes) else ""
         res.server_url = parsed.get(2).decode(errors='ignore') if isinstance(parsed.get(2), bytes) else ""
@@ -478,9 +478,7 @@ async def send_getlogin_mm(data, base_url, token, release_version):
         if r.status_code != 200: return None
         c = r.content
         parsed = parse_protobuf_response(c)
-        
-        class GetLoginRes:
-            pass
+        class GetLoginRes: pass
         res = GetLoginRes()
         res.functional_addrs = parsed.get(1).decode(errors='ignore') if isinstance(parsed.get(1), bytes) else ""
         res.nickname = parsed.get(2).decode(errors='ignore') if isinstance(parsed.get(2), bytes) else "Player"
@@ -516,7 +514,6 @@ async def process_account_uid_pass_mm(uid, password):
         glr = await send_getlogin_mm(payload, mlr.server_url, mlr.token, rel)
         if not glr: return None
         rp, dr = glr
-        acc_id = str(mlr.account_id)
         data = {
             'account_id': mlr.account_id,
             'nickname': rp.nickname,
@@ -568,6 +565,7 @@ async def run_account_online_worker_mm(account_data):
             print(f"{G}✅ ONLINE{RS} [{acc_id}] | {Y}{nickname}{RS} | Lvl {C}{level}{RS}")
             with online_lock:
                 online_accounts.append({'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv})
+            _first_online_event.set()   # <-- أول بوت أونلاين فعليًا
             while True:
                 writer.write(ka); await writer.drain()
                 try:
@@ -679,46 +677,62 @@ async def mm_main_loop():
         await asyncio.sleep(60)
 
 # ============================================================
-#  V-BADGE DISPATCHER
+#  V-BADGE DISPATCHER (per-bot مستقل وسلس)
 # ============================================================
-async def bot_blast_task(acc, cycle_no):
-    sent = 0
-    for i in range(REQ_PER_BOT_PER_SEC):
-        if TARGET_UID is None: break
+async def per_bot_blaster(acc, bot_index):
+    """يرسل REQ_PER_BOT_PER_SEC موزعة بسلاسة كل ثانية لهذا البوت فقط."""
+    interval = 1.0 / max(1, REQ_PER_BOT_PER_SEC)
+    cycle_no = 0
+    while True:
+        if TARGET_UID is None:
+            await asyncio.sleep(0.5); continue
+        if acc['writer'].is_closing():
+            await asyncio.sleep(0.5); continue
+        cycle_no += 1
         try:
             av = get_next_avatar()
             pkt = await yasser_SendInv_packet(acc['uid'], TARGET_UID, av, acc['key'], acc['iv'])
             if pkt and not acc['writer'].is_closing():
-                acc['writer'].write(pkt); await acc['writer'].drain()
-                sent += 1
-                print(f"  ✓ [{acc['uid']}] #{cycle_no}.{i+1} → {TARGET_UID} (avatar: {av})")
+                acc['writer'].write(pkt)
+                await acc['writer'].drain()
+                print(f"  ✓ [{acc['uid']}] #{cycle_no} → {TARGET_UID} (avatar: {av})")
         except Exception as e:
             print(f"❌ [{acc['uid']}] vbadge error: {e}")
-    return sent
+            await asyncio.sleep(1.0)
+        await asyncio.sleep(interval)
 
 async def vbadge_dispatcher_loop():
-    global TARGET_UID
     print(f"▶ V-BADGE dispatcher waiting for online accounts...")
     while True:
         with online_lock:
             if online_accounts: break
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
+
     print(f"▶ V-BADGE dispatcher STARTED → target {TARGET_UID}")
-    cycle_no = 0
+    launched: Dict[str, asyncio.Task] = {}
+
     while True:
         try:
             with online_lock:
                 snap = list(online_accounts)
-            if not snap:
-                await asyncio.sleep(1.0); continue
-            cycle_no += 1; total_sent = 0; total_bots = len(snap)
-            for bi, acc in enumerate(snap, start=1):
-                if TARGET_UID is None: break
-                print(f"🤖 Bot {bi}/{total_bots} [{acc['uid']}] blasting {REQ_PER_BOT_PER_SEC} req...")
-                total_sent += await bot_blast_task(acc, f"{cycle_no}-{bi}")
-            print(f"── cycle {cycle_no}: {total_sent} req across {total_bots} bots ──")
-            await asyncio.sleep(V_INTERVAL)
+
+            # شغّل blaster مستقل لكل بوت جديد
+            for acc in snap:
+                if acc['uid'] not in launched or launched[acc['uid']].done():
+                    launched[acc['uid']] = asyncio.create_task(
+                        per_bot_blaster(acc, len(launched) + 1)
+                    )
+
+            # ألغِ blasters لبوتات خرجت من online
+            current_uids = {a['uid'] for a in snap}
+            for uid, t in list(launched.items()):
+                if uid not in current_uids:
+                    t.cancel()
+                    launched.pop(uid, None)
+
+            await asyncio.sleep(1.0)
         except asyncio.CancelledError:
+            for t in launched.values(): t.cancel()
             break
         except Exception as e:
             print(f"❌ dispatcher error: {e}")
@@ -729,6 +743,7 @@ async def vbadge_dispatcher_loop():
 # ============================================================
 def _run_service_thread():
     global _loop, _login_task, _dispatch_task
+    _first_online_event.clear()
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
 
@@ -756,10 +771,16 @@ def start_service(target_uid: str):
             TARGET_UID = target_uid
             return False, "Service already running — target updated."
         TARGET_UID = target_uid
+        _first_online_event.clear()
         _service_thread = Thread(target=_run_service_thread, daemon=True)
         _service_thread.start()
         _running = True
-        return True, f"Service started → target {target_uid}"
+
+    # انتظر حتى أول بوت يصبح ONLINE فعليًا (بحد أقصى FIRST_ONLINE_TIMEOUT ثانية)
+    got_online = _first_online_event.wait(timeout=FIRST_ONLINE_TIMEOUT)
+    if not got_online:
+        return True, f"Service started but NO account came online yet (target {target_uid}) — check logs."
+    return True, f"Service started and FIRST bot is ONLINE → target {target_uid}"
 
 def stop_service():
     global _running, _loop, _login_task, _dispatch_task, TARGET_UID
@@ -782,12 +803,13 @@ def stop_service():
                         a['writer'].close()
                 except: pass
             online_accounts.clear()
+        _first_online_event.clear()
         return True, "Service stopped."
 
 # ============================================================
 #  FASTAPI APP
 # ============================================================
-app = FastAPI(title="Ariyan V-Badge API", version="1.0")
+app = FastAPI(title="Ariyan V-Badge API", version="1.1")
 
 @app.get("/")
 def root():
@@ -795,7 +817,8 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "running": _running, "online_bots": len(online_accounts)}
+    return {"ok": True, "running": _running, "online_bots": len(online_accounts),
+            "first_online": _first_online_event.is_set()}
 
 @app.get("/start")
 def api_start(uid: str = Query(..., description="Target UID")):
@@ -805,7 +828,9 @@ def api_start(uid: str = Query(..., description="Target UID")):
     if not accs:
         return JSONResponse(status_code=400, content={"ok": False, "error": "No accounts configured."})
     started, msg = start_service(uid)
-    return {"ok": True, "started": started, "message": msg, "target_uid": TARGET_UID, "accounts_loaded": len(accs)}
+    return {"ok": True, "started": started, "message": msg,
+            "target_uid": TARGET_UID, "accounts_loaded": len(accs),
+            "online_bots": len(online_accounts)}
 
 @app.get("/stop")
 def api_stop(uid: Optional[str] = Query(None)):
@@ -816,7 +841,9 @@ def api_stop(uid: Optional[str] = Query(None)):
 def api_status():
     with online_lock:
         bots = [{"uid": a["uid"]} for a in online_accounts]
-    return {"running": _running, "target_uid": TARGET_UID, "online_bots_count": len(bots), "online_bots": bots}
+    return {"running": _running, "target_uid": TARGET_UID,
+            "first_online": _first_online_event.is_set(),
+            "online_bots_count": len(bots), "online_bots": bots}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
