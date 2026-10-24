@@ -1,16 +1,23 @@
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import sys, time, json, ssl, socket, threading, asyncio, random, struct, uuid
 from datetime import datetime
+from threading import Thread
+from typing import Optional, Dict, List
 
 import urllib3
 import httpx
+import urllib.request
+import importlib.util
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google_play_scraper import app as play_scraper
 from protobuf_decoder.protobuf_decoder import Parser
 
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+import uvicorn
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -20,25 +27,28 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # ============================================================
 #  PROTOBUF DEFINITIONS
 # ============================================================
-import urllib.request
-
 PROTO_URL = "https://raw.githubusercontent.com/mdrajababof2378866-hue/Lojik/refs/heads/main/Proto.py"
 PROTO_LOCAL = "Proto.py"
 
 def _ensure_proto_file():
-    if os.path.exists(PROTO_LOCAL) and os.path.getsize(PROTO_LOCAL) > 500: return
+    if os.path.exists(PROTO_LOCAL) and os.path.getsize(PROTO_LOCAL) > 500:
+        return
+    print("[*] Downloading Proto.py from GitHub...")
     try:
         req = urllib.request.Request(PROTO_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             data = r.read()
-        with open(PROTO_LOCAL, "wb") as f: f.write(data)
+        if len(data) < 500:
+            raise RuntimeError("Downloaded file too small — probably 404")
+        with open(PROTO_LOCAL, "wb") as f:
+            f.write(data)
+        print("[+] Proto.py downloaded successfully.")
     except Exception as e:
-        print(f"[!] Failed to download Proto.py: {e}", flush=True)
+        print(f"[!] Failed to download Proto.py: {e}")
         sys.exit(1)
 
 _ensure_proto_file()
 
-import importlib.util
 _spec = importlib.util.spec_from_file_location("Proto", PROTO_LOCAL)
 _proto = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_proto)
@@ -50,15 +60,18 @@ GetLoginDataRes_pb = _proto.GetLoginDataRes_pb
 # ============================================================
 #  CONFIG
 # ============================================================
+C = "\033[96m"; G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"
+RS = "\033[0m"; BOLD = "\033[1m"; M = "\033[95m"
+
 ACCOUNTS_TXT_FILE = "Ariyan.txt"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 KEEP_ALIVE_INTERVAL = 5.0
-MAX_LOGIN_ATTEMPTS = 3
-NUM_WORKERS = 20
-REQ_PER_BOT_PER_SEC = 10
-V_INTERVAL = 0.05
+MAX_LOGIN_ATTEMPTS = 2
+NUM_WORKERS = 3
+REQ_PER_BOT_PER_SEC = 8
+V_INTERVAL = 1.0
 
 AVATAR_POOL = [
     902055033, 902055004, 902055031, 902055001, 902055032,
@@ -83,18 +96,22 @@ headers_mm = {
 }
 
 _client_mm = httpx.Client(
-    verify=False,
-    timeout=15.0,
+    verify=False, timeout=15.0,
     limits=httpx.Limits(max_connections=1000, max_keepalive_connections=500)
 )
 
 # ============================================================
-#  STATE
+#  GLOBAL STATE
 # ============================================================
-online_accounts = []          # list of {uid, writer, key, iv, client_version, region}
+TARGET_UID: Optional[str] = None
+online_accounts = []
 online_lock = threading.Lock()
-active_tasks = {}             # {uid: asyncio.Event}
-active_tasks_lock = threading.Lock()
+
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_login_task: Optional[asyncio.Task] = None
+_dispatch_task: Optional[asyncio.Task] = None
+_running = False
+_state_lock = threading.Lock()
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
@@ -102,33 +119,11 @@ _avatar_lock = threading.Lock()
 def get_next_avatar():
     global _avatar_cursor
     with _avatar_lock:
-        if _avatar_cursor >= len(AVATAR_POOL): _avatar_cursor = 0
-        avatar = AVATAR_POOL[_avatar_cursor]
+        if _avatar_cursor >= len(AVATAR_POOL):
+            _avatar_cursor = 0
+        a = AVATAR_POOL[_avatar_cursor]
         _avatar_cursor += 1
-    return avatar
-
-# ============================================================
-#  TARGET INFO (non-blocking helper)
-# ============================================================
-async def get_target_info(uid):
-    """محاولة جلب معلومات الهدف. لا تفشل أبداً - ترجع قيم افتراضية."""
-    default = {"name": "غير معروف", "level": "-", "region": "-", "uid": uid}
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=3.0) as client:
-            url = f"https://api.reisxd.com/api/ffinfo?uid={uid}"
-            res = await client.get(url)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("status") == "success":
-                    return {
-                        "name": data.get("name", "غير معروف"),
-                        "level": data.get("level", "-"),
-                        "region": data.get("region", "-"),
-                        "uid": uid
-                    }
-    except Exception:
-        pass
-    return default
+    return a
 
 # ============================================================
 #  ASYNC PACKET HELPERS
@@ -178,28 +173,19 @@ async def generate_packet_async(hex_payload, ptype, K, V):
     else: header = ptype + "0000"
     return bytes.fromhex(header + length_hex + enc)
 
-# ============================================================
-#  V-BADGE PACKET (نسخة ديناميكية - تقرأ client_version والمنطقة من الحساب)
-# ============================================================
-async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V,
-                                 client_version="1.132.6", bot_region="BD"):
+async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V):
     fields = {
         1: 33,
         2: {
-            1: int(target_uid), 2: bot_region, 3: 1, 4: 1,
+            1: int(target_uid), 2: "ME", 3: 1, 4: 1,
             6: "yyt", 7: 330, 8: 1000, 9: 100,
-            10: bot_region, 12: 1, 13: int(target_uid),
-            16: 1,
-            17: {2: 159, 4: "y[WW", 6: 11, 8: client_version, 9: 3, 10: 1},
+            10: "DZ", 12: 1, 13: int(target_uid), 16: 1,
+            17: {2: 159, 4: "y[WW", 6: 11, 8: "1.118.1", 9: 3, 10: 1},
             18: 306, 19: 18, 24: 902000306,
-            26: {},
-            27: {1: 11, 2: int(bot_uid), 3: 999},
-            28: {},
-            31: {1: 1, 2: 32768},
-            32: 32768,
+            26: {}, 27: {1: 11, 2: int(bot_uid), 3: 999},
+            28: {}, 31: {1: 1, 2: 32768}, 32: 32768,
             34: {
-                1: int(bot_uid),
-                2: 8,
+                1: int(bot_uid), 2: 8,
                 3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006",
                 4: int(avatar_id),
             }
@@ -209,7 +195,7 @@ async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V,
     return await generate_packet_async(proto.hex(), '0515', K, V)
 
 # ============================================================
-#  DEVICE HELPERS & DNS
+#  DEVICE HELPERS
 # ============================================================
 def _generate_new_device_mm():
     device_list = [
@@ -218,16 +204,12 @@ def _generate_new_device_mm():
         ("OnePlus", "CPH2451", "Adreno (TM) 740", "Android OS 13 / API-33"),
     ]
     brand, model, gpu, os_ver = random.choice(device_list)
-    return {
-        "unique_device_id": f"Google|{uuid.uuid4()}",
-        "brand": brand, "model": model, "gpu_renderer": gpu, "system_software": os_ver,
-        "screen_width": random.choice([1080, 1600]),
-        "screen_height": random.choice([2400, 720]),
-        "screen_dpi": str(random.randint(300, 420)),
-        "memory": random.randint(2800, 6500),
-        "processor_details": f"ARM64 FP ASIMD AES VMH | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
-        "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}"
-    }
+    return {"unique_device_id": f"Google|{uuid.uuid4()}", "brand": brand, "model": model,
+            "gpu_renderer": gpu, "system_software": os_ver,
+            "screen_width": random.choice([1080, 1600]), "screen_height": random.choice([2400, 720]),
+            "screen_dpi": str(random.randint(300, 420)), "memory": random.randint(2800, 6500),
+            "processor_details": f"ARM64 FP ASIMD AES VMH | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
+            "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}"}
 
 def get_device_for_account_mm(account_identifier):
     devices = {}
@@ -239,22 +221,71 @@ def get_device_for_account_mm(account_identifier):
         except: devices = {}
     acc_key = str(account_identifier).strip()
     if acc_key in devices: return devices[acc_key]
-    new_device = _generate_new_device_mm()
-    devices[acc_key] = new_device
+    nd = _generate_new_device_mm(); devices[acc_key] = nd
     try:
         with open(DEVICES_FILE, "w", encoding="utf-8") as f: json.dump(devices, f, indent=4)
     except: pass
-    return new_device
+    return nd
+
+# ============================================================
+#  DNS / SOCKET
+# ============================================================
+CLOUDFLARE_PRIMARY_DNS = "1.1.1.1"
+CLOUDFLARE_SECONDARY_DNS = "1.0.0.1"
+_DNS_CACHE = {}
+_DNS_CACHE_TTL = 300.0
 
 async def resolve_host_cloudflare(hostname):
     if not hostname: return hostname
     parts = hostname.split('.')
     if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts): return hostname
-    try:
-        ip_info = await asyncio.get_running_loop().getaddrinfo(hostname, None, family=socket.AF_INET)
-        if ip_info: return ip_info[0][4][0]
-    except: pass
-    return hostname
+    now = time.time()
+    if hostname in _DNS_CACHE:
+        ip, exp = _DNS_CACHE[hostname]
+        if now < exp: return ip
+
+    def _q(srv):
+        s = None
+        try:
+            tid = random.randint(1000, 65535)
+            hdr = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+            qn = b"".join(bytes([len(p)]) + p.encode('ascii') for p in hostname.split('.')) + b"\x00"
+            pkt = hdr + qn + struct.pack(">HH", 1, 1)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.2)
+            s.sendto(pkt, (srv, 53))
+            resp, _ = s.recvfrom(1024)
+            if len(resp) >= 12:
+                anc = struct.unpack(">H", resp[6:8])[0]
+                if anc > 0:
+                    off = 12 + len(qn) + 4
+                    for _ in range(anc):
+                        if off >= len(resp): break
+                        if (resp[off] & 0xC0) == 0xC0: off += 2
+                        else:
+                            while off < len(resp) and resp[off] != 0: off += 1 + resp[off]
+                            off += 1
+                        if off + 10 > len(resp): break
+                        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", resp[off:off+10]); off += 10
+                        if rtype == 1 and rdlen == 4 and off + 4 <= len(resp):
+                            return socket.inet_ntoa(resp[off:off+4])
+                        off += rdlen
+        except: pass
+        finally:
+            if s:
+                try: s.close()
+                except: pass
+        return None
+
+    loop = asyncio.get_running_loop()
+    ip = await loop.run_in_executor(None, _q, CLOUDFLARE_PRIMARY_DNS)
+    if not ip: ip = await loop.run_in_executor(None, _q, CLOUDFLARE_SECONDARY_DNS)
+    if not ip:
+        try:
+            infos = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
+            if infos: ip = infos[0][4][0]
+        except: ip = hostname
+    if ip: _DNS_CACHE[hostname] = (ip, now + _DNS_CACHE_TTL)
+    return ip or hostname
 
 def optimize_tcp_socket(sock):
     try:
@@ -291,38 +322,36 @@ def _load_token_cache():
     if not os.path.exists(TOKEN_CACHE_FILE): return {}
     try:
         with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content: return {}
-        return _json_deserializer(json.loads(content))
+            c = f.read().strip()
+        return _json_deserializer(json.loads(c)) if c else {}
     except: return {}
 
 def _save_token_cache(cache):
     try:
         tmp = TOKEN_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f: json.dump(cache, f, indent=2, default=_json_serializer)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, default=_json_serializer)
         os.replace(tmp, TOKEN_CACHE_FILE)
     except: pass
 
 def cache_get(uid):
-    cache = _load_token_cache()
-    entry = cache.get(str(uid))
-    if not entry: return None
-    if time.time() - entry.get("cached_at", 0) > TOKEN_CACHE_TTL:
+    c = _load_token_cache(); e = c.get(str(uid))
+    if not e: return None
+    if time.time() - e.get("cached_at", 0) > TOKEN_CACHE_TTL:
         cache_invalidate(uid); return None
-    if str(entry.get("account_id", "")).isdigit(): entry["account_id"] = int(entry["account_id"])
-    if not isinstance(entry.get("login_payload_data"), (bytes, bytearray)):
+    if str(e.get("account_id", "")).isdigit(): e["account_id"] = int(e["account_id"])
+    if not isinstance(e.get("login_payload_data"), (bytes, bytearray)):
         cache_invalidate(uid); return None
-    return entry
+    return e
 
-def cache_set(uid, account_data):
-    cache = _load_token_cache()
-    entry = dict(account_data); entry["cached_at"] = time.time()
-    cache[str(uid)] = entry; _save_token_cache(cache)
+def cache_set(uid, data):
+    c = _load_token_cache(); e = dict(data); e["cached_at"] = time.time()
+    c[str(uid)] = e; _save_token_cache(c)
 
 def cache_invalidate(uid):
-    cache = _load_token_cache()
-    if str(uid) in cache:
-        del cache[str(uid)]; _save_token_cache(cache)
+    c = _load_token_cache()
+    if str(uid) in c:
+        del c[str(uid)]; _save_token_cache(c)
 
 # ============================================================
 #  LOGIN PIPELINE
@@ -333,74 +362,65 @@ async def aes_encrypt_mm(payload, key, iv):
 def get_proto_field(d, key, default=None):
     if not d or not isinstance(d, dict): return default
     if key in d:
-        val = d[key].get('data')
-        return val if val is not None else default
+        v = d[key].get('data'); return v if v is not None else default
     if str(key) in d:
-        val = d[str(key)].get('data')
-        return val if val is not None else default
+        v = d[str(key)].get('data'); return v if v is not None else default
     return default
 
 async def parse_results_mm(parsed_results):
-    result_dict = {}
-    for result in parsed_results:
-        field_data = {"wire_type": result.wire_type}
-        if result.wire_type == "varint": field_data["data"] = result.data
-        elif result.wire_type == "string": field_data["data"] = result.data
-        elif result.wire_type == "bytes": field_data["data"] = result.data
-        elif result.wire_type == "length_delimited":
-            if hasattr(result.data, "results"): field_data["data"] = await parse_results_mm(result.data.results)
-            elif isinstance(result.data, list): field_data["data"] = await parse_results_mm(result.data)
-            else: field_data["data"] = str(result.data)
-        result_dict[str(result.field)] = field_data
-    return result_dict
+    out = {}
+    for r in parsed_results:
+        fd = {"wire_type": r.wire_type}
+        if r.wire_type == "varint": fd["data"] = r.data
+        elif r.wire_type == "string": fd["data"] = r.data
+        elif r.wire_type == "bytes": fd["data"] = r.data
+        elif r.wire_type == "length_delimited":
+            if hasattr(r.data, "results"): fd["data"] = await parse_results_mm(r.data.results)
+            elif isinstance(r.data, list): fd["data"] = await parse_results_mm(r.data)
+            else: fd["data"] = str(r.data)
+        out[str(r.field)] = fd
+    return out
 
 async def get_playstore_version_mm():
-    loop = asyncio.get_running_loop()
+    loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id'))
-        return result.get("version")
-    except: return None
+        r = await loop.run_in_executor(None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id'))
+        return r.get("version")
+    except: return "1.132.6"
 
 async def version_config_mm():
     try:
-        app_version = await get_playstore_version_mm() or "1.132.6"
-        api_url = (f"https://version.ggwhitehawk.com/live/ver.php?version={app_version}"
-                   "&lang=hi&device=android&channel=android&appstore=googleplay&region=BD"
-                   "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
-        response = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: _client_mm.get(api_url, timeout=8.0))
-        if response.status_code == 200:
-            data = response.json()
-            s_url = data.get("server_url"); r_ver = data.get("remote_version"); l_rel = data.get("latest_release_version")
-            if s_url and r_ver and l_rel: return (l_rel, r_ver, s_url)
+        av = await get_playstore_version_mm() or "1.132.6"
+        url = (f"https://version.ggwhitehawk.com/live/ver.php?version={av}"
+               "&lang=hi&device=android&channel=android&appstore=googleplay&region=BD"
+               "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
+        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: _client_mm.get(url, timeout=8.0))
+        if resp.status_code == 200:
+            d = resp.json()
+            s, r, l = d.get("server_url"), d.get("remote_version"), d.get("latest_release_version")
+            if s and r and l: return (l, r, s)
     except: pass
     return ("OB55", "1.132.6", "https://clientbp.ggpolarbear.com/live/")
 
 async def get_access_token_mm(uid, password):
     url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
-    hdrs = {
-        "Host": "100067.connect.garena.com",
-        "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 13;en;IN;)",
-        "Content-Type": "application/json",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "close"
-    }
-    payload = {
-        "client_id": 100067,
-        "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-        "client_type": 2, "password": str(password).strip(),
-        "response_type": "token", "uid": int(str(uid).strip())
-    }
+    hdrs = {"Host": "100067.connect.garena.com",
+            "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 13;en;IN;)",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip, deflate, br", "Connection": "close"}
+    payload = {"client_id": 100067,
+               "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+               "client_type": 2, "password": str(password).strip(),
+               "response_type": "token", "uid": int(str(uid).strip())}
     for attempt in range(2):
         try:
-            response = await asyncio.get_running_loop().run_in_executor(
+            r = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: _client_mm.post(url, headers=hdrs, json=payload))
-            if response.status_code == 200:
-                res_data = response.json(); inner = res_data.get("data", res_data)
-                open_id = inner.get("open_id"); access_token = inner.get("access_token")
-                platform = inner.get("platform", 4)
-                if open_id and access_token: return open_id, access_token, platform
-            elif response.status_code == 429:
+            if r.status_code == 200:
+                j = r.json(); inner = j.get("data", j)
+                o, a, p = inner.get("open_id"), inner.get("access_token"), inner.get("platform", 4)
+                if o and a: return o, a, p
+            elif r.status_code == 429:
                 await asyncio.sleep(1.0); continue
         except: pass
         await asyncio.sleep(0.3)
@@ -439,325 +459,424 @@ async def build_majorlogin_payload_mm(open_id, access_token, platform, client_ve
         ml.field_106 = "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b"
         ml.field_107 = "c8e41b7a93f02d56e1a94c7b8203f5d1"
         return await aes_encrypt_mm(ml.SerializeToString(), AES_KEY_MM, AES_IV_MM)
-    except: return None
+    except Exception as e:
+        print(f"{R}❌ build_majorlogin error: {e}{RS}")
+        return None
 
 async def send_majorlogin_mm(data, release_version, server_url):
     try:
         url = f"{server_url}MajorLogin"
-        req_headers = headers_mm.copy(); req_headers["ReleaseVersion"] = release_version
-        response = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: _client_mm.post(url, headers=req_headers, data=data))
-        if response.status_code != 200: return None
-        response_content = response.content
-        if len(response_content) < 40: return None
-        proto_payload = response_content[64:] if len(response_content) > 64 else response_content
-        res_proto = MajorLoginRes_pb()
+        h = headers_mm.copy(); h["ReleaseVersion"] = release_version
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client_mm.post(url, headers=h, data=data))
+        if r.status_code != 200: return None
+        c = r.content
+        if len(c) < 40: return None
+        payload = c[64:] if len(c) > 64 else c
+        proto = MajorLoginRes_pb()
         try:
-            res_proto.ParseFromString(proto_payload)
-            if res_proto.token: return res_proto
+            proto.ParseFromString(payload)
+            if proto.token: return proto
         except: pass
-        for offset in range(min(128, len(proto_payload))):
+        for off in range(min(128, len(payload))):
             try:
-                candidate = MajorLoginRes_pb(); candidate.ParseFromString(proto_payload[offset:])
-                if candidate.token: return candidate
+                cand = MajorLoginRes_pb(); cand.ParseFromString(payload[off:])
+                if cand.token: return cand
             except: pass
         try:
-            res_proto = MajorLoginRes_pb(); res_proto.ParseFromString(response_content); return res_proto
+            proto = MajorLoginRes_pb(); proto.ParseFromString(c); return proto
         except: return None
     except: return None
 
 async def send_getlogin_mm(data, base_url, token, release_version):
     try:
         url = f"{base_url.rstrip('/')}/GetLoginData"
-        req_headers = headers_mm.copy(); req_headers["ReleaseVersion"] = release_version
-        req_headers['Authorization'] = f"Bearer {token}"; req_headers['Host'] = "clientbp.ppmainecoonghj.com"
-        response = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: _client_mm.post(url, headers=req_headers, data=data))
-        if response.status_code != 200: return None
-        response_content = response.content
-        res_proto = GetLoginDataRes_pb(); parsed_successfully = False
+        h = headers_mm.copy(); h["ReleaseVersion"] = release_version
+        h['Authorization'] = f"Bearer {token}"; h['Host'] = "clientbp.ppmainecoonghj.com"
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client_mm.post(url, headers=h, data=data))
+        if r.status_code != 200: return None
+        c = r.content; proto = GetLoginDataRes_pb(); ok = False
         try:
-            res_proto.ParseFromString(response_content)
-            if res_proto.functional_addrs or res_proto.informational_addrs: parsed_successfully = True
+            proto.ParseFromString(c)
+            if proto.functional_addrs or proto.informational_addrs: ok = True
         except: pass
-        if not parsed_successfully:
-            for offset in range(min(128, len(response_content))):
+        if not ok:
+            for off in range(min(128, len(c))):
                 try:
-                    candidate = GetLoginDataRes_pb(); candidate.ParseFromString(response_content[offset:])
-                    if candidate.functional_addrs or candidate.informational_addrs: res_proto = candidate; break
+                    cand = GetLoginDataRes_pb(); cand.ParseFromString(c[off:])
+                    if cand.functional_addrs or cand.informational_addrs:
+                        proto = cand; break
                 except: pass
-        dict_res = {}
+        dr = {}
         try:
-            parsed = Parser().parse(response_content.hex()); dict_res = await parse_results_mm(parsed)
+            dr = await parse_results_mm(Parser().parse(c.hex()))
         except: pass
-        return res_proto, dict_res
+        return proto, dr
     except: return None
 
 async def build_tcp_startup_packet_mm(account_id, token, server_time, key, iv, typ='OnLine'):
-    uid_hex = f"{int(account_id):016x}"; timestamp_hex = f"{int(server_time):08x}"
-    encode_token = token.encode()
-    encrypted_packet = (await aes_encrypt_mm(encode_token, key, iv)).hex()
-    encrypted_packet_length = f"{len(encrypted_packet) // 2:08x}"
+    uid_hex = f"{int(account_id):016x}"; ts_hex = f"{int(server_time):08x}"
+    enc = (await aes_encrypt_mm(token.encode(), key, iv)).hex()
+    ln = f"{len(enc)//2:08x}"
     if typ == 'OnLine':
-        return f"7219{uid_hex}{timestamp_hex}00000000{encrypted_packet_length}{encrypted_packet}"
-    else:
-        return f"8119{uid_hex}{timestamp_hex}{encrypted_packet_length}{encrypted_packet}"
+        return f"7219{uid_hex}{ts_hex}00000000{ln}{enc}"
+    return f"8119{uid_hex}{ts_hex}{ln}{enc}"
 
-async def send_keep_alive_mm(): return bytes.fromhex("0219")
+async def send_keep_alive_mm():
+    return bytes.fromhex("0219")
 
 async def process_account_uid_pass_mm(uid, password):
     cached = cache_get(uid)
     if cached: return cached
     try:
-        verconfig_res = await version_config_mm()
-        if not verconfig_res: return None
-        release_version, client_version, server_url = verconfig_res
-        tokengrant_res = await get_access_token_mm(uid, password)
-        if not tokengrant_res: return None
-        open_id, access_token, platform = tokengrant_res
-        device_info = get_device_for_account_mm(uid)
-        login_payload_data = await build_majorlogin_payload_mm(open_id, access_token, platform, client_version, device_info)
-        if not login_payload_data: return None
-        majorlogin_res = await send_majorlogin_mm(login_payload_data, release_version, server_url)
-        if not majorlogin_res: return None
-        getlogin_res = await send_getlogin_mm(login_payload_data, majorlogin_res.server_url, majorlogin_res.token, release_version)
-        if not getlogin_res: return None
-        res_proto, dict_res = getlogin_res
-        acc_id = str(majorlogin_res.account_id)
-        level = int(get_proto_field(dict_res, 6, 1)); exp = int(get_proto_field(dict_res, 7, 0)); likes = int(get_proto_field(dict_res, 8, 0))
-        nickname = res_proto.nickname or get_proto_field(dict_res, 4, f"Player_{acc_id}")
-        region = majorlogin_res.noti_region or get_proto_field(dict_res, 3, "BD")
-        account_data = {
-            'account_id': majorlogin_res.account_id, 'nickname': nickname, 'region': region,
-            'level': level, 'exp': exp, 'likes': likes, 'open_id': open_id, 'access_token': access_token,
-            'platform': str(platform), 'token': majorlogin_res.token, 'server_time': majorlogin_res.kts,
-            'aes_ak': majorlogin_res.ak, 'iv_i': majorlogin_res.aiv,
-            'functional_addrs': res_proto.functional_addrs or get_proto_field(dict_res, 14),
-            'informational_addrs': res_proto.informational_addrs or get_proto_field(dict_res, 32),
-            'release_version': release_version, 'client_version': client_version,
-            'server_url': majorlogin_res.server_url, 'login_payload_data': login_payload_data,
+        v = await version_config_mm()
+        if not v: return None
+        rel, cver, srv = v
+        t = await get_access_token_mm(uid, password)
+        if not t: return None
+        oid, at, plat = t
+        dev = get_device_for_account_mm(uid)
+        payload = await build_majorlogin_payload_mm(oid, at, plat, cver, dev)
+        if not payload: return None
+        mlr = await send_majorlogin_mm(payload, rel, srv)
+        if not mlr: return None
+        glr = await send_getlogin_mm(payload, mlr.server_url, mlr.token, rel)
+        if not glr: return None
+        rp, dr = glr
+        acc_id = str(mlr.account_id)
+        data = {
+            'account_id': mlr.account_id,
+            'nickname': rp.nickname or get_proto_field(dr, 4, f"Player_{acc_id}"),
+            'region': mlr.noti_region or get_proto_field(dr, 3, "BD"),
+            'level': int(get_proto_field(dr, 6, 1)),
+            'exp': int(get_proto_field(dr, 7, 0)),
+            'likes': int(get_proto_field(dr, 8, 0)),
+            'open_id': oid, 'access_token': at, 'platform': str(plat),
+            'token': mlr.token, 'server_time': mlr.kts,
+            'aes_ak': mlr.ak, 'iv_i': mlr.aiv,
+            'functional_addrs': rp.functional_addrs or get_proto_field(dr, 14),
+            'informational_addrs': rp.informational_addrs or get_proto_field(dr, 32),
+            'release_version': rel, 'client_version': cver,
+            'server_url': mlr.server_url, 'login_payload_data': payload,
             'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password
         }
-        cache_set(uid, account_data)
-        print(f"[+] Logged in {uid} as {nickname} | region={region} ver={client_version}", flush=True)
-        return account_data
+        cache_set(uid, data)
+        return data
     except Exception as e:
-        print(f"[!] Login failed {uid}: {e}", flush=True)
+        print(f"{R}❌ process_account error: {e}{RS}")
         return None
 
 # ============================================================
-#  ONLINE WORKER (يحفظ client_version وregion ويمنع التكرار)
+#  ONLINE WORKER
 # ============================================================
 async def run_account_online_worker_mm(account_data):
     acc_id = str(account_data['account_id'])
-    func_addrs = account_data.get('functional_addrs')
-    key = account_data.get('aes_ak')
-    iv = account_data.get('iv_i')
-    client_ver = account_data.get('client_version', '1.132.6')
-    region = account_data.get('region', 'BD')
-    if not func_addrs: return
-    
-    ip, port = func_addrs.split(":")
+    nickname = account_data.get('nickname', 'Player')
+    level = account_data.get('level', 1)
+    fa = account_data.get('functional_addrs')
+    key = account_data.get('aes_ak'); iv = account_data.get('iv_i')
+    if not fa: return
+    ip, port = fa.split(":")
     while True:
         writer = None; reader = None
         try:
-            tcp_startup = await build_tcp_startup_packet_mm(
-                account_data['account_id'], account_data['token'], account_data['server_time'],
-                account_data['aes_ak'], account_data['iv_i'], typ='OnLine')
-            resolved_ip = await resolve_host_cloudflare(ip)
-            reader, writer = await asyncio.open_connection(resolved_ip, int(port))
-            raw_sock = writer.get_extra_info('socket')
-            if raw_sock: optimize_tcp_socket(raw_sock)
-            writer.write(bytes.fromhex(tcp_startup)); await writer.drain()
-            init_ka = await send_keep_alive_mm()
-            if init_ka and not writer.is_closing(): writer.write(init_ka); await writer.drain()
-            
-            # منع تكرار نفس الحساب في القائمة
+            tcp = await build_tcp_startup_packet_mm(
+                account_data['account_id'], account_data['token'],
+                account_data['server_time'], account_data['aes_ak'],
+                account_data['iv_i'], typ='OnLine')
+            rip = await resolve_host_cloudflare(ip)
+            reader, writer = await asyncio.open_connection(rip, int(port))
+            raw = writer.get_extra_info('socket')
+            if raw: optimize_tcp_socket(raw)
+            writer.write(bytes.fromhex(tcp)); await writer.drain()
+            ka = await send_keep_alive_mm()
+            if ka and not writer.is_closing():
+                writer.write(ka); await writer.drain()
+            print(f"{G}✅ ONLINE{RS} [{acc_id}] | {Y}{nickname}{RS} | Lvl {C}{level}{RS}")
             with online_lock:
-                online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
-                online_accounts.append({
-                    'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv,
-                    'client_version': client_ver, 'region': region,
-                })
-            print(f"[✓] Online: {acc_id} ({account_data.get('nickname','?')})", flush=True)
-            
-            ka_bytes = await send_keep_alive_mm()
+                online_accounts.append({'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv})
             while True:
-                if writer.is_closing(): raise ConnectionError("closed")
-                writer.write(ka_bytes); await writer.drain()
+                writer.write(ka); await writer.drain()
                 try:
                     data = await asyncio.wait_for(reader.read(1024), timeout=KEEP_ALIVE_INTERVAL)
                     if data == b'': raise ConnectionError("Server closed")
                 except asyncio.TimeoutError: pass
-        except Exception:
+        except asyncio.CancelledError:
             with online_lock:
                 online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
             await safe_close_writer(writer)
-            await asyncio.sleep(3)
+            raise
+        except Exception as e:
+            print(f"{Y}⚠️ Connection lost {acc_id} ({e}). Reconnecting 5s...{RS}")
+            with online_lock:
+                online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
+            await safe_close_writer(writer)
+            await asyncio.sleep(5)
 
 # ============================================================
-#  ACCOUNTS LOADER & LOGIN WORKERS
+#  ACCOUNTS LOADER
 # ============================================================
 def load_accounts_from_ariyan_txt():
     accounts = []
     if os.path.exists(ACCOUNTS_TXT_FILE):
         try:
             with open(ACCOUNTS_TXT_FILE, "r", encoding="utf-8") as f:
-                content = f.read()
-                if content.strip().startswith("["):
-                    data = json.loads(content)
-                    for item in data:
-                        if "uid" in item and "password" in item:
-                            accounts.append({"uid": str(item["uid"]), "password": item["password"]})
-                else:
-                    for line in content.splitlines():
-                        l = line.strip()
-                        if not l or l.startswith("#") or l.startswith("//"): continue
-                        parts = None
-                        for delim in [":", "|", ",", " "]:
-                            if delim in l:
-                                p = [x.strip() for x in l.split(delim, 1)]
-                                if len(p) == 2 and p[0] and p[1]: parts = p; break
-                        if parts:
-                            u, p = parts
-                            if u.isdigit(): accounts.append({"uid": u, "password": p})
+                for line in f.readlines():
+                    l = line.strip()
+                    if not l or l.startswith("#") or l.startswith("//"): continue
+                    parts = None
+                    for delim in [":", "|", ",", " "]:
+                        if delim in l:
+                            p = [x.strip() for x in l.split(delim, 1)]
+                            if len(p) == 2 and p[0] and p[1]:
+                                parts = p; break
+                    if parts:
+                        u, p = parts
+                        if u.isdigit(): accounts.append({"uid": u, "password": p})
         except Exception as e:
-            print(f"[!] Failed to load accounts: {e}", flush=True)
+            print(f"{R}❌ Error reading {ACCOUNTS_TXT_FILE}: {e}{RS}")
     return accounts
 
+def load_accounts():
+    # 1) env var
+    raw = os.environ.get("ACCOUNTS_DATA", "").strip()
+    if raw:
+        accs = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            parts = None
+            for delim in [":", "|", ",", " "]:
+                if delim in line:
+                    p = [x.strip() for x in line.split(delim, 1)]
+                    if len(p) == 2 and p[0] and p[1]: parts = p; break
+            if parts:
+                u, p = parts
+                if u.isdigit(): accs.append({"uid": u, "password": p})
+        if accs: return accs
+    # 2) local file
+    return load_accounts_from_ariyan_txt()
+
+# ============================================================
+#  WORKER QUEUE
+# ============================================================
 async def worker_login_queue(worker_id, queue):
     while True:
-        try: acc_info = await queue.get()
-        except asyncio.CancelledError: break
-        if acc_info is None: queue.task_done(); break
+        try:
+            acc_info = await queue.get()
+        except asyncio.CancelledError:
+            break
+        if acc_info is None:
+            queue.task_done(); break
+        idx = acc_info['idx']; total = acc_info['total']
         uid = acc_info['uid']; pwd = acc_info['password']
-        account_data = None
+        ad = None
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-            account_data = await process_account_uid_pass_mm(uid, pwd)
-            if account_data: break
-            await asyncio.sleep(1.0)
-        if account_data:
-            asyncio.create_task(run_account_online_worker_mm(account_data))
+            print(f"{C}[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...{RS}")
+            try:
+                ad = await process_account_uid_pass_mm(uid, pwd)
+                if ad: break
+                if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
+            except:
+                if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
+        if not ad:
+            print(f"{R}[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}{RS}")
+            queue.task_done(); continue
+        asyncio.create_task(run_account_online_worker_mm(ad))
+        await asyncio.sleep(0.8)
         queue.task_done()
-        await asyncio.sleep(0.1)
 
 async def mm_main_loop():
-    accounts = load_accounts_from_ariyan_txt()
+    accounts = load_accounts()
     if not accounts:
-        print("[!] No accounts found in Ariyan.txt", flush=True)
+        print(f"{R}❌ No accounts found!{RS}")
         return
-    print(f"[*] Loaded {len(accounts)} accounts. Starting login workers...", flush=True)
+    total = len(accounts)
+    print(f"{C}🔁 {total} accounts | {NUM_WORKERS} workers{RS}")
     queue = asyncio.Queue()
-    for acc in accounts: await queue.put({'uid': acc['uid'], 'password': acc['password']})
-    for _ in range(NUM_WORKERS): await queue.put(None)
+    for idx, acc in enumerate(accounts, start=1):
+        await queue.put({'idx': idx, 'total': total,
+                         'uid': acc['uid'], 'password': acc['password']})
+    for _ in range(NUM_WORKERS):
+        await queue.put(None)
     workers = []
     for w in range(1, NUM_WORKERS + 1):
-        t = asyncio.create_task(worker_login_queue(w, queue))
-        workers.append(t)
+        workers.append(asyncio.create_task(worker_login_queue(w, queue)))
     await asyncio.gather(*workers, return_exceptions=True)
+    print(f"{G}✅ All {total} accounts processed. Keep-alive loops running.{RS}")
+    while True:
+        await asyncio.sleep(60)
 
 # ============================================================
-#  V-BADGE SPAMMER (يبدأ فوراً حتى لو ما في بوتات جاهزة)
+#  V-BADGE DISPATCHER
 # ============================================================
-async def spam_worker_for_uid(target_uid, stop_event):
-    print(f"[*] Spam worker STARTED for {target_uid}", flush=True)
-    while not stop_event.is_set():
+async def bot_blast_task(acc, cycle_no):
+    sent = 0
+    for i in range(REQ_PER_BOT_PER_SEC):
+        if TARGET_UID is None: break
+        try:
+            av = get_next_avatar()
+            pkt = await yasser_SendInv_packet(acc['uid'], TARGET_UID, av, acc['key'], acc['iv'])
+            if pkt and not acc['writer'].is_closing():
+                acc['writer'].write(pkt); await acc['writer'].drain()
+                sent += 1
+                print(f"{G}  ✓ [{acc['uid']}] #{cycle_no}.{i+1} → {TARGET_UID} (avatar: {Y}{av}{G}){RS}")
+        except Exception as e:
+            print(f"{R}❌ [{acc['uid']}] vbadge error: {e}{RS}")
+    return sent
+
+async def vbadge_dispatcher_loop():
+    global TARGET_UID
+    print(f"{G}▶ V-BADGE dispatcher waiting for online accounts...{RS}")
+    while True:
         with online_lock:
-            snapshot = list(online_accounts)
-        if not snapshot:
-            await asyncio.sleep(0.5)
-            continue
-        for acc in snapshot:
-            if stop_event.is_set(): break
-            try:
-                avatar_id = get_next_avatar()
-                pkt = await yasser_SendInv_packet(
-                    acc['uid'], target_uid, avatar_id, acc['key'], acc['iv'],
-                    client_version=acc.get('client_version', '1.132.6'),
-                    bot_region=acc.get('region', 'BD'),
-                )
-                if pkt and not acc['writer'].is_closing():
-                    acc['writer'].write(pkt)
-                    await acc['writer'].drain()
-            except Exception:
-                pass
-        await asyncio.sleep(V_INTERVAL)
-    print(f"[*] Spam worker STOPPED for {target_uid}", flush=True)
+            if online_accounts: break
+        await asyncio.sleep(0.5)
+    print(f"{G}▶ V-BADGE dispatcher STARTED → target {TARGET_UID}{RS}")
+    cycle_no = 0
+    while True:
+        try:
+            with online_lock:
+                snap = list(online_accounts)
+            if not snap:
+                await asyncio.sleep(1.0); continue
+            cycle_no += 1; total_sent = 0; total_bots = len(snap)
+            for bi, acc in enumerate(snap, start=1):
+                if TARGET_UID is None: break
+                print(f"{C}🤖 Bot {bi}/{total_bots} [{acc['uid']}] blasting {REQ_PER_BOT_PER_SEC} req...{RS}")
+                total_sent += await bot_blast_task(acc, f"{cycle_no}-{bi}")
+            print(f"{C}── cycle {cycle_no}: {total_sent} req across {total_bots} bots ──{RS}")
+            await asyncio.sleep(V_INTERVAL)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"{R}❌ dispatcher error: {e}{RS}")
+            await asyncio.sleep(2)
 
 # ============================================================
-#  FLASK API
+#  SERVICE CONTROL
 # ============================================================
-app = Flask(__name__)
-loop = asyncio.new_event_loop()
+def _run_service_thread():
+    global _loop, _login_task, _dispatch_task
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
 
-def start_loop():
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+    async def _runner():
+        global _login_task, _dispatch_task
+        _login_task = asyncio.create_task(mm_main_loop())
+        await asyncio.sleep(2)
+        _dispatch_task = asyncio.create_task(vbadge_dispatcher_loop())
+        try:
+            await asyncio.gather(_login_task, _dispatch_task, return_exceptions=True)
+        except asyncio.CancelledError: pass
 
-threading.Thread(target=start_loop, daemon=True).start()
-loop.call_soon_threadsafe(lambda: asyncio.create_task(mm_main_loop()))
-
-@app.route('/', methods=['GET'])
-def health():
-    return jsonify({"status": "ok", "online_bots": len(online_accounts), "active": len(active_tasks)}), 200
-
-@app.route('/spam', methods=['GET'])
-def spam():
-    uid = request.args.get('uid')
-    if not uid or not uid.isdigit():
-        return jsonify({"error": "Invalid UID"}), 400
-
-    # التحقق من عدم التكرار
-    with active_tasks_lock:
-        if uid in active_tasks:
-            return jsonify({"status": "already_spamming", "uid": uid,
-                            "message": "هذا الآيدي قاعد ينضرب من قبل"}), 200
-        # ✅ ابدأ الضرب فوراً قبل جلب الاسم
-        stop_event = asyncio.Event()
-        active_tasks[uid] = stop_event
-        loop.call_soon_threadsafe(
-            lambda u=uid, s=stop_event: asyncio.create_task(spam_worker_for_uid(u, s)))
-
-    # محاولة جلب معلومات الهدف بـ timeout قصير (لا تفشل الطلب لو تأخرت)
-    target_info = {"name": "جاري الجلب...", "level": "-", "region": "-", "uid": uid}
     try:
-        fut = asyncio.run_coroutine_threadsafe(get_target_info(uid), loop)
-        target_info = fut.result(timeout=2.0)
-    except Exception:
-        target_info = {"name": "غير معروف", "level": "-", "region": "-", "uid": uid}
+        _loop.run_until_complete(_runner())
+    except Exception as e:
+        print(f"service thread error: {e}")
+    finally:
+        try: _loop.close()
+        except: pass
 
-    online_count = len(online_accounts)
-    return jsonify({
-        "status": "started",
-        "target_info": target_info,
-        "online_bots": online_count,
-        "message": "✅ بدأ الضرب فوراً" if online_count > 0
-                   else "⏳ الضرب شغّال، سينتظر تجهيز البوتات تلقائياً"
-    }), 200
+def start_service(target_uid: str):
+    global TARGET_UID, _service_thread, _running
+    with _state_lock:
+        if _running:
+            TARGET_UID = target_uid
+            return False, "Service already running — target updated."
+        TARGET_UID = target_uid
+        _service_thread = Thread(target=_run_service_thread, daemon=True)
+        _service_thread.start()
+        _running = True
+        return True, f"Service started → target {target_uid}"
 
-@app.route('/stop', methods=['GET'])
-def stop():
-    uid = request.args.get('uid')
-    if not uid:
-        return jsonify({"error": "Missing UID"}), 400
-    with active_tasks_lock:
-        ev = active_tasks.pop(uid, None)
-    if ev:
-        loop.call_soon_threadsafe(ev.set)
-        return jsonify({"status": "stopped", "uid": uid, "message": "تم إيقاف الضرب"}), 200
-    return jsonify({"error": "No active spam for this UID"}), 404
+def stop_service():
+    global _running, _loop, _login_task, _dispatch_task, TARGET_UID
+    with _state_lock:
+        if not _running: return False, "Service is not running."
+        TARGET_UID = None
+        _running = False
+        try:
+            if _loop and not _loop.is_closed():
+                def _cancel():
+                    for t in (_login_task, _dispatch_task):
+                        if t and not t.done(): t.cancel()
+                _loop.call_soon_threadsafe(_cancel)
+        except Exception as e:
+            print(f"stop error: {e}")
+        with online_lock:
+            for a in online_accounts:
+                try:
+                    if a.get('writer') and not a['writer'].is_closing():
+                        a['writer'].close()
+                except: pass
+            online_accounts.clear()
+        return True, "Service stopped."
 
-@app.route('/status', methods=['GET'])
-def status():
-    return jsonify({
-        "online_bots": len(online_accounts),
-        "active_targets": list(active_tasks.keys()),
-        "online_details": [
-            {"uid": a['uid'], "version": a.get('client_version'), "region": a.get('region')}
-            for a in list(online_accounts)
-        ]
-    }), 200
+# ============================================================
+#  FASTAPI APP
+# ============================================================
+app = FastAPI(title="Ariyan V-Badge API", version="1.0")
 
+@app.get("/")
+def root():
+    return {
+        "name": "Ariyan V-Badge API",
+        "endpoints": {
+            "start": "/start?uid=TARGET_UID",
+            "stop": "/stop?uid=TARGET_UID",
+            "status": "/status",
+            "health": "/health",
+        },
+    }
+
+@app.get("/health")
+def health():
+    return {"ok": True, "running": _running, "online_bots": len(online_accounts)}
+
+@app.get("/start")
+def api_start(uid: str = Query(..., description="Target UID")):
+    if not uid.isdigit():
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": "uid must be numeric"})
+    accs = load_accounts()
+    if not accs:
+        return JSONResponse(status_code=400, content={
+            "ok": False,
+            "error": "No accounts configured. Set ACCOUNTS_DATA env or add Ariyan.txt.",
+        })
+    started, msg = start_service(uid)
+    return {
+        "ok": True, "started": started, "message": msg,
+        "target_uid": TARGET_UID, "accounts_loaded": len(accs),
+    }
+
+@app.get("/stop")
+def api_stop(uid: Optional[str] = Query(None)):
+    stopped, msg = stop_service()
+    return {"ok": True, "stopped": stopped, "message": msg, "requested_uid": uid}
+
+@app.get("/status")
+def api_status():
+    with online_lock:
+        bots = [{"uid": a["uid"]} for a in online_accounts]
+    return {
+        "running": _running,
+        "target_uid": TARGET_UID,
+        "online_bots_count": len(bots),
+        "online_bots": bots,
+        "config": {
+            "req_per_bot_per_sec": REQ_PER_BOT_PER_SEC,
+            "interval": V_INTERVAL,
+            "avatar_pool_size": len(AVATAR_POOL),
+            "num_workers": NUM_WORKERS,
+        },
+    }
+
+# ============================================================
+#  MAIN
+# ============================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("api:app", host="0.0.0.0", port=port, log_level="info")
