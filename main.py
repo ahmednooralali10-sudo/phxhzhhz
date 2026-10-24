@@ -2,6 +2,7 @@ import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import sys, time, json, ssl, socket, threading, asyncio, random, struct, uuid
+import collections
 from datetime import datetime
 from threading import Thread
 from typing import Optional, Dict, List
@@ -12,8 +13,8 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google_play_scraper import app as play_scraper
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, HTMLResponse
 import uvicorn
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -33,10 +34,10 @@ DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 KEEP_ALIVE_INTERVAL = 5.0
 MAX_LOGIN_ATTEMPTS = 2
-NUM_WORKERS = 10              # رُفع من 3 إلى 10 لتسريع دخول الحسابات
+NUM_WORKERS = 10
 REQ_PER_BOT_PER_SEC = 8
 V_INTERVAL = 1.0
-FIRST_ONLINE_TIMEOUT = 90     # أقصى انتظار لأول بوت يصبح ONLINE
+FIRST_ONLINE_TIMEOUT = 90
 
 AVATAR_POOL = [
     902055033, 902055004, 902055031, 902055001, 902055032,
@@ -79,11 +80,15 @@ _running = False
 _state_lock = threading.Lock()
 _service_thread: Optional[Thread] = None
 
-# event يُطلق عند أول بوت يصبح ONLINE فعليًا
 _first_online_event = threading.Event()
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
+
+# Logs + WebSocket
+_log_buffer = collections.deque(maxlen=500)
+_log_lock = threading.Lock()
+_ws_clients = set()
 
 def get_next_avatar():
     global _avatar_cursor
@@ -92,6 +97,32 @@ def get_next_avatar():
         a = AVATAR_POOL[_avatar_cursor]
         _avatar_cursor += 1
     return a
+
+# ============================================================
+#  LOGGING (إلى الطرفية + إلى WebSocket)
+# ============================================================
+def _broadcast_ws(payload: dict):
+    if not _ws_clients: return
+    for loop, ws in list(_ws_clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(payload), loop)
+        except: pass
+
+def log(msg: str, level: str = "info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    color = {"info": C, "ok": G, "warn": Y, "err": R, "sys": M}.get(level, C)
+    print(f"{color}[{ts}]{RS} {msg}", flush=True)
+    entry = {"t": ts, "msg": msg, "level": level}
+    with _log_lock:
+        _log_buffer.append(entry)
+    _broadcast_ws({"type": "log", **entry})
+
+def _broadcast_status():
+    try:
+        with online_lock:
+            bots = [{"uid": a["uid"]} for a in online_accounts]
+        _broadcast_ws({"type": "status", "online_bots": bots})
+    except: pass
 
 # ============================================================
 #  ASYNC PACKET HELPERS
@@ -405,7 +436,7 @@ async def build_majorlogin_payload_mm(open_id, access_token, platform, client_ve
         proto_bytes = await create_proto_async(fields)
         return await aes_encrypt_mm(proto_bytes, AES_KEY_MM, AES_IV_MM)
     except Exception as e:
-        print(f"❌ build_majorlogin error: {e}")
+        log(f"❌ build_majorlogin error: {e}", "err")
         return None
 
 def read_varint(data, offset):
@@ -533,7 +564,7 @@ async def process_account_uid_pass_mm(uid, password):
         cache_set(uid, data)
         return data
     except Exception as e:
-        print(f"❌ process_account error: {e}")
+        log(f"❌ process_account error: {e}", "err")
         return None
 
 # ============================================================
@@ -562,10 +593,11 @@ async def run_account_online_worker_mm(account_data):
             ka = await send_keep_alive_mm()
             if ka and not writer.is_closing():
                 writer.write(ka); await writer.drain()
-            print(f"{G}✅ ONLINE{RS} [{acc_id}] | {Y}{nickname}{RS} | Lvl {C}{level}{RS}")
+            log(f"✅ ONLINE [{acc_id}] | {nickname} | Lvl {level}", "ok")
             with online_lock:
                 online_accounts.append({'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv})
-            _first_online_event.set()   # <-- أول بوت أونلاين فعليًا
+            _first_online_event.set()
+            _broadcast_status()
             while True:
                 writer.write(ka); await writer.drain()
                 try:
@@ -575,12 +607,14 @@ async def run_account_online_worker_mm(account_data):
         except asyncio.CancelledError:
             with online_lock:
                 online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
+            _broadcast_status()
             await safe_close_writer(writer)
             raise
         except Exception as e:
-            print(f"{Y}⚠️ Connection lost {acc_id} ({e}). Reconnecting 5s...{RS}")
+            log(f"⚠️ Connection lost {acc_id} ({e}). Reconnecting 5s...", "warn")
             with online_lock:
                 online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
+            _broadcast_status()
             await safe_close_writer(writer)
             await asyncio.sleep(5)
 
@@ -605,7 +639,7 @@ def load_accounts_from_ariyan_txt():
                         u, p = parts
                         if u.isdigit(): accounts.append({"uid": u, "password": p})
         except Exception as e:
-            print(f"❌ Error reading {ACCOUNTS_TXT_FILE}: {e}")
+            log(f"❌ Error reading {ACCOUNTS_TXT_FILE}: {e}", "err")
     return accounts
 
 def load_accounts():
@@ -641,7 +675,7 @@ async def worker_login_queue(worker_id, queue):
         uid = acc_info['uid']; pwd = acc_info['password']
         ad = None
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-            print(f"[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...")
+            log(f"[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...", "info")
             try:
                 ad = await process_account_uid_pass_mm(uid, pwd)
                 if ad: break
@@ -649,7 +683,7 @@ async def worker_login_queue(worker_id, queue):
             except:
                 if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
         if not ad:
-            print(f"[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}")
+            log(f"[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}", "warn")
             queue.task_done(); continue
         asyncio.create_task(run_account_online_worker_mm(ad))
         await asyncio.sleep(0.8)
@@ -658,10 +692,10 @@ async def worker_login_queue(worker_id, queue):
 async def mm_main_loop():
     accounts = load_accounts()
     if not accounts:
-        print("❌ No accounts found!")
+        log("❌ No accounts found!", "err")
         return
     total = len(accounts)
-    print(f"🔁 {total} accounts | {NUM_WORKERS} workers")
+    log(f"🔁 {total} accounts | {NUM_WORKERS} workers", "sys")
     queue = asyncio.Queue()
     for idx, acc in enumerate(accounts, start=1):
         await queue.put({'idx': idx, 'total': total,
@@ -672,7 +706,7 @@ async def mm_main_loop():
     for w in range(1, NUM_WORKERS + 1):
         workers.append(asyncio.create_task(worker_login_queue(w, queue)))
     await asyncio.gather(*workers, return_exceptions=True)
-    print(f"✅ All {total} accounts processed. Keep-alive loops running.")
+    log(f"✅ All {total} accounts processed. Keep-alive loops running.", "ok")
     while True:
         await asyncio.sleep(60)
 
@@ -680,7 +714,6 @@ async def mm_main_loop():
 #  V-BADGE DISPATCHER (per-bot مستقل وسلس)
 # ============================================================
 async def per_bot_blaster(acc, bot_index):
-    """يرسل REQ_PER_BOT_PER_SEC موزعة بسلاسة كل ثانية لهذا البوت فقط."""
     interval = 1.0 / max(1, REQ_PER_BOT_PER_SEC)
     cycle_no = 0
     while True:
@@ -695,20 +728,20 @@ async def per_bot_blaster(acc, bot_index):
             if pkt and not acc['writer'].is_closing():
                 acc['writer'].write(pkt)
                 await acc['writer'].drain()
-                print(f"  ✓ [{acc['uid']}] #{cycle_no} → {TARGET_UID} (avatar: {av})")
+                log(f"✓ [{acc['uid']}] #{cycle_no} → {TARGET_UID} (avatar: {av})", "sys")
         except Exception as e:
-            print(f"❌ [{acc['uid']}] vbadge error: {e}")
+            log(f"❌ [{acc['uid']}] vbadge error: {e}", "err")
             await asyncio.sleep(1.0)
         await asyncio.sleep(interval)
 
 async def vbadge_dispatcher_loop():
-    print(f"▶ V-BADGE dispatcher waiting for online accounts...")
+    log("▶ V-BADGE dispatcher waiting for online accounts...", "sys")
     while True:
         with online_lock:
             if online_accounts: break
         await asyncio.sleep(0.3)
 
-    print(f"▶ V-BADGE dispatcher STARTED → target {TARGET_UID}")
+    log(f"▶ V-BADGE dispatcher STARTED → target {TARGET_UID}", "sys")
     launched: Dict[str, asyncio.Task] = {}
 
     while True:
@@ -716,14 +749,12 @@ async def vbadge_dispatcher_loop():
             with online_lock:
                 snap = list(online_accounts)
 
-            # شغّل blaster مستقل لكل بوت جديد
             for acc in snap:
                 if acc['uid'] not in launched or launched[acc['uid']].done():
                     launched[acc['uid']] = asyncio.create_task(
                         per_bot_blaster(acc, len(launched) + 1)
                     )
 
-            # ألغِ blasters لبوتات خرجت من online
             current_uids = {a['uid'] for a in snap}
             for uid, t in list(launched.items()):
                 if uid not in current_uids:
@@ -735,7 +766,7 @@ async def vbadge_dispatcher_loop():
             for t in launched.values(): t.cancel()
             break
         except Exception as e:
-            print(f"❌ dispatcher error: {e}")
+            log(f"❌ dispatcher error: {e}", "err")
             await asyncio.sleep(2)
 
 # ============================================================
@@ -759,7 +790,7 @@ def _run_service_thread():
     try:
         _loop.run_until_complete(_runner())
     except Exception as e:
-        print(f"service thread error: {e}")
+        log(f"service thread error: {e}", "err")
     finally:
         try: _loop.close()
         except: pass
@@ -769,17 +800,20 @@ def start_service(target_uid: str):
     with _state_lock:
         if _running:
             TARGET_UID = target_uid
+            log(f"Target updated to {target_uid}", "warn")
             return False, "Service already running — target updated."
         TARGET_UID = target_uid
         _first_online_event.clear()
         _service_thread = Thread(target=_run_service_thread, daemon=True)
         _service_thread.start()
         _running = True
+        log(f"🚀 Service starting → target {target_uid}", "sys")
 
-    # انتظر حتى أول بوت يصبح ONLINE فعليًا (بحد أقصى FIRST_ONLINE_TIMEOUT ثانية)
     got_online = _first_online_event.wait(timeout=FIRST_ONLINE_TIMEOUT)
     if not got_online:
+        log(f"⚠️ Service started but NO account came online yet (target {target_uid})", "warn")
         return True, f"Service started but NO account came online yet (target {target_uid}) — check logs."
+    log(f"✅ Service started and FIRST bot is ONLINE → target {target_uid}", "ok")
     return True, f"Service started and FIRST bot is ONLINE → target {target_uid}"
 
 def stop_service():
@@ -795,7 +829,7 @@ def stop_service():
                         if t and not t.done(): t.cancel()
                 _loop.call_soon_threadsafe(_cancel)
         except Exception as e:
-            print(f"stop error: {e}")
+            log(f"stop error: {e}", "err")
         with online_lock:
             for a in online_accounts:
                 try:
@@ -804,16 +838,180 @@ def stop_service():
                 except: pass
             online_accounts.clear()
         _first_online_event.clear()
+        _broadcast_status()
+        log("🛑 Service stopped.", "warn")
         return True, "Service stopped."
+
+# ============================================================
+#  DASHBOARD HTML
+# ============================================================
+DASHBOARD_HTML = r"""
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ariyan V-Badge — Terminal</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;font-family:'JetBrains Mono','Courier New',monospace}
+  body{background:#0a0e14;color:#c8d3e0;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  .topbar{background:linear-gradient(90deg,#0d1420,#14213a);padding:10px 16px;display:flex;align-items:center;
+          justify-content:space-between;border-bottom:1px solid #1e2d45;box-shadow:0 2px 12px #0008;flex-wrap:wrap;gap:8px}
+  .title{font-weight:bold;color:#5ee6ff;letter-spacing:1px;font-size:14px}
+  .title span{color:#7a8fa8;font-weight:normal}
+  .status{display:flex;gap:10px;align-items:center;font-size:12px;flex-wrap:wrap}
+  .badge{padding:3px 10px;border-radius:4px;border:1px solid #2a3d5a;background:#0f1a2b;color:#c8d3e0}
+  .badge b{color:#5ee6ff}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-left:6px}
+  .on{background:#33ff88;box-shadow:0 0 8px #33ff88}
+  .off{background:#ff4466;box-shadow:0 0 8px #ff4466}
+  .main{display:grid;grid-template-columns:1fr 320px;gap:8px;padding:8px;flex:1;overflow:hidden}
+  @media(max-width:720px){.main{grid-template-columns:1fr;grid-template-rows:1fr 200px}}
+  .panel{background:#0d1420;border:1px solid #1e2d45;border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
+  .panel-header{padding:8px 12px;background:#101a2b;border-bottom:1px solid #1e2d45;
+                font-size:12px;color:#5ee6ff;letter-spacing:1px;display:flex;justify-content:space-between}
+  #terminal{flex:1;overflow-y:auto;padding:10px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+  #terminal::-webkit-scrollbar,#bots::-webkit-scrollbar{width:8px}
+  #terminal::-webkit-scrollbar-thumb,#bots::-webkit-scrollbar-thumb{background:#1e2d45;border-radius:4px}
+  .l-info{color:#5ec8ff}.l-ok{color:#55ff99}.l-warn{color:#ffcc55}.l-err{color:#ff5577}.l-sys{color:#c77dff}
+  .ts{color:#4a5f7a;margin-left:6px}
+  #bots{flex:1;overflow-y:auto;padding:6px}
+  .bot{padding:6px 10px;margin:3px 0;background:#0f1a2b;border:1px solid #1a2a40;border-radius:5px;
+       font-size:12px;display:flex;justify-content:space-between;align-items:center}
+  .bot .uid{color:#7affc0}
+  .bot .nick{color:#ffd77a;font-size:11px}
+  .controls{padding:8px;display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid #1e2d45;background:#0a1220}
+  .controls input{flex:1;min-width:120px;background:#0a1220;border:1px solid #1e2d45;color:#c8d3e0;
+                  padding:8px 10px;border-radius:5px;font-family:inherit;font-size:13px;outline:none}
+  .controls input:focus{border-color:#5ee6ff;box-shadow:0 0 0 2px #5ee6ff22}
+  .btn{padding:8px 14px;border:none;border-radius:5px;font-family:inherit;font-weight:bold;
+       font-size:12px;cursor:pointer;letter-spacing:1px;transition:.15s}
+  .btn-start{background:#16a34a;color:#fff}
+  .btn-start:hover{background:#22c55e;box-shadow:0 0 12px #22c55e88}
+  .btn-stop{background:#dc2626;color:#fff}
+  .btn-stop:hover{background:#ef4444;box-shadow:0 0 12px #ef444488}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .stats{padding:8px 12px;font-size:12px;color:#7a8fa8;border-top:1px solid #1e2d45;background:#0a1220}
+  .stats b{color:#5ee6ff}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="title">▌ ARIYAN V-BADGE <span>// terminal dashboard</span></div>
+  <div class="status">
+    <div class="badge">SERVICE <span id="svcDot" class="dot off"></span></div>
+    <div class="badge">ONLINE <b id="botCount">0</b></div>
+    <div class="badge">TARGET <b id="targetUid">—</b></div>
+  </div>
+</div>
+<div class="main">
+  <div class="panel">
+    <div class="panel-header"><span>▸ LIVE LOGS</span><span id="wsStatus" style="color:#ffcc55">connecting...</span></div>
+    <div id="terminal"></div>
+    <div class="controls">
+      <input id="uidInput" placeholder="Target UID (مثال: 123456789)" />
+      <button class="btn btn-start" id="startBtn">▶ START</button>
+      <button class="btn btn-stop" id="stopBtn">■ STOP</button>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-header"><span>▸ ONLINE BOTS</span></div>
+    <div id="bots"></div>
+    <div class="stats">Total: <b id="statTotal">0</b> | First ONLINE: <b id="statFirst">—</b></div>
+  </div>
+</div>
+<script>
+const term = document.getElementById('terminal');
+const botsEl = document.getElementById('bots');
+const wsStatus = document.getElementById('wsStatus');
+
+function appendLog(t, msg, level){
+  const div = document.createElement('div');
+  div.className = 'l-'+level;
+  div.innerHTML = `<span class="ts">[${t}]</span> ${escapeHtml(msg)}`;
+  term.appendChild(div);
+  while(term.children.length > 500) term.removeChild(term.firstChild);
+  term.scrollTop = term.scrollHeight;
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderBots(bots){
+  botsEl.innerHTML = '';
+  bots.forEach(b=>{
+    const d = document.createElement('div');
+    d.className='bot';
+    d.innerHTML = `<span class="uid">${b.uid}</span>` +
+                  (b.nickname? `<span class="nick">${escapeHtml(b.nickname)}</span>`:'');
+    botsEl.appendChild(d);
+  });
+  document.getElementById('botCount').textContent = bots.length;
+  document.getElementById('statTotal').textContent = bots.length;
+}
+
+async function refreshStatus(){
+  try{
+    const r = await fetch('/status'); const j = await r.json();
+    document.getElementById('svcDot').className = 'dot ' + (j.running?'on':'off');
+    document.getElementById('targetUid').textContent = j.target_uid || '—';
+    document.getElementById('statFirst').textContent = j.first_online?'YES':'NO';
+    renderBots(j.online_bots || []);
+  }catch(e){}
+}
+
+function connectWS(){
+  const proto = location.protocol==='https:'?'wss':'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = ()=>{ wsStatus.textContent='connected'; wsStatus.style.color='#55ff99'; };
+  ws.onclose = ()=>{ wsStatus.textContent='reconnecting...'; wsStatus.style.color='#ff5577';
+                     setTimeout(connectWS, 2000); };
+  ws.onmessage = (ev)=>{
+    try{
+      const d = JSON.parse(ev.data);
+      if(d.type==='log') appendLog(d.t, d.msg, d.level);
+      else if(d.type==='status') refreshStatus();
+    }catch(e){}
+  };
+}
+connectWS();
+
+document.getElementById('startBtn').onclick = async ()=>{
+  const uid = document.getElementById('uidInput').value.trim();
+  if(!uid || !/^\d+$/.test(uid)){ alert('UID يجب أن يكون أرقام فقط'); return; }
+  appendLog(new Date().toTimeString().slice(0,8), `→ Sending START for ${uid}...`, 'sys');
+  try{
+    const r = await fetch('/start?uid='+uid);
+    const j = await r.json();
+    appendLog(new Date().toTimeString().slice(0,8), j.message || JSON.stringify(j), j.ok?'ok':'err');
+  }catch(e){ appendLog(new Date().toTimeString().slice(0,8), 'START error: '+e, 'err'); }
+  refreshStatus();
+};
+document.getElementById('stopBtn').onclick = async ()=>{
+  appendLog(new Date().toTimeString().slice(0,8), '→ Sending STOP...', 'sys');
+  try{ await fetch('/stop'); }catch(e){}
+  refreshStatus();
+};
+
+setInterval(refreshStatus, 2000);
+refreshStatus();
+</script>
+</body>
+</html>
+"""
 
 # ============================================================
 #  FASTAPI APP
 # ============================================================
-app = FastAPI(title="Ariyan V-Badge API", version="1.1")
+app = FastAPI(title="Ariyan V-Badge API", version="1.2")
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {"name": "Ariyan V-Badge API", "endpoints": {"/start?uid=": "start", "/stop": "stop", "/status": "status"}}
+    return DASHBOARD_HTML
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
 
 @app.get("/health")
 def health():
@@ -844,6 +1042,25 @@ def api_status():
     return {"running": _running, "target_uid": TARGET_UID,
             "first_online": _first_online_event.is_set(),
             "online_bots_count": len(bots), "online_bots": bots}
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    loop = asyncio.get_running_loop()
+    _ws_clients.add((loop, ws))
+    with _log_lock:
+        history = list(_log_buffer)[-100:]
+    for h in history:
+        try: await ws.send_json({"type": "log", **h})
+        except: break
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except: pass
+    finally:
+        _ws_clients.discard((loop, ws))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
